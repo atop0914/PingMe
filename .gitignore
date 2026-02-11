@@ -30,3 +30,4 @@ config/*.yml
 
 # Build
 pingme-server
+bin/
