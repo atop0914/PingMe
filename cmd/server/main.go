@@ -1,16 +1,19 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"PingMe/internal/config"
 	"PingMe/internal/handler"
 	"PingMe/internal/handler/auth"
 	"PingMe/internal/handler/userprofile"
+	"PingMe/internal/handler/ws"
 	"PingMe/internal/logger"
 	"PingMe/internal/middleware"
 	"PingMe/internal/pkg/database"
@@ -65,6 +68,7 @@ func main() {
 	baseHandler := handler.NewHandler(cfg)
 	authHandler := auth.NewHandler(userSvc)
 	userHandler := userprofile.NewHandler(userSvc)
+	wsHandler := ws.NewHandler(cfg)
 
 	// Set Gin mode based on environment
 	if cfg.App.Env == "production" {
@@ -82,6 +86,10 @@ func main() {
 	// Health and version endpoints (no auth required)
 	r.GET("/health", baseHandler.HealthCheck)
 	r.GET("/version", baseHandler.VersionInfo)
+
+	// WebSocket endpoint
+	r.GET("/ws", wsHandler.HandleWebSocket)
+	r.GET("/ws/stats", wsHandler.GetConnectionStats)
 
 	// API v1 group
 	v1 := r.Group("/api/v1")
@@ -122,4 +130,14 @@ func main() {
 
 	<-quit
 	logger.Info("Shutting down server...")
+
+	// Shutdown WebSocket hub
+	hubCtx, hubCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer hubCancel()
+	
+	// Send signal to shutdown hub
+	select {
+	case wsHandler.Hub.Unregister <- nil:
+	case <-hubCtx.Done():
+	}
 }
