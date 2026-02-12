@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"PingMe/internal/config"
+	"PingMe/internal/gateway"
 	"PingMe/internal/handler"
 	"PingMe/internal/handler/auth"
 	"PingMe/internal/handler/userprofile"
@@ -68,7 +69,18 @@ func main() {
 	baseHandler := handler.NewHandler(cfg)
 	authHandler := auth.NewHandler(userSvc)
 	userHandler := userprofile.NewHandler(userSvc)
-	wsHandler := ws.NewHandler(cfg)
+
+	// Initialize WebSocket hub first (before wsHandler)
+	hub := gateway.NewHub(cfg)
+
+	// Initialize Redis client for online status
+	if err := hub.InitRedis(); err != nil {
+		logger.Warn("Failed to initialize Redis client, online status disabled",
+			"error", err)
+		// Continue without Redis - online status won't be shared across instances
+	}
+
+	wsHandler := ws.NewHandler(cfg, hub)
 
 	// Set Gin mode based on environment
 	if cfg.App.Env == "production" {
@@ -115,6 +127,17 @@ func main() {
 		c.JSON(404, response.FailWithMessage("not found", 404))
 	})
 
+	// Create context for hub
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Start hub with context
+	hub.Run(ctx)
+
+	// Start cleanup task for online status
+	if hub.RedisClient != nil {
+		hub.StartCleanupTask(ctx)
+	}
+
 	// Graceful shutdown
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
@@ -131,13 +154,25 @@ func main() {
 	<-quit
 	logger.Info("Shutting down server...")
 
-	// Shutdown WebSocket hub
+	// Stop cleanup task
+	hub.StopCleanupTask()
+
+	// Cancel hub context
+	cancel()
+
+	// Close Redis client
+	if hub.RedisClient != nil {
+		hub.RedisClient.Close()
+	}
+
+	// Send signal to shutdown hub
 	hubCtx, hubCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer hubCancel()
-	
-	// Send signal to shutdown hub
+
+	// Wait for hub to shutdown
 	select {
-	case wsHandler.Hub.Unregister <- nil:
 	case <-hubCtx.Done():
 	}
+
+	logger.Info("Server shutdown complete")
 }

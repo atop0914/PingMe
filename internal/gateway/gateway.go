@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -12,9 +13,11 @@ import (
 	"PingMe/internal/config"
 	"PingMe/internal/logger"
 	"PingMe/internal/model/user"
+	"PingMe/internal/pkg/redis"
 
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 )
 
@@ -82,6 +85,12 @@ type Hub struct {
 	mu          sync.RWMutex
 	Config      *config.Config
 	wg          sync.WaitGroup
+
+	// Redis 在线状态管理
+	RedisClient     *redis.Client
+	InstanceID      string
+	PresenceTTL     int // 在线状态 TTL（秒）
+	cleanupTicker   *time.Ticker
 }
 
 // RateLimiter 连接级别限流器
@@ -111,6 +120,13 @@ type JWTClaims struct {
 
 // NewHub 创建新的 Hub
 func NewHub(cfg *config.Config) *Hub {
+	// 生成实例 ID（优先使用环境变量，否则使用主机名+随机后缀）
+	instanceID := os.Getenv("INSTANCE_ID")
+	if instanceID == "" {
+		hostname, _ := os.Hostname()
+		instanceID = fmt.Sprintf("%s-%s", hostname, uuid.New().String()[:8])
+	}
+
 	return &Hub{
 		Connections: make(map[string]*Connection),
 		UserConns:   make(map[string]map[string]*Connection),
@@ -118,6 +134,69 @@ func NewHub(cfg *config.Config) *Hub {
 		Register:    make(chan *Connection),
 		Unregister:  make(chan *Connection),
 		Config:      cfg,
+		InstanceID:  instanceID,
+		PresenceTTL: 30, // 默认 30 秒
+	}
+}
+
+// InitRedis 初始化 Redis 客户端
+func (h *Hub) InitRedis() error {
+	client, err := redis.NewClient(h.Config, h.InstanceID)
+	if err != nil {
+		return fmt.Errorf("failed to init Redis client: %w", err)
+	}
+
+	h.RedisClient = client
+
+	logger.Info("Hub Redis initialized",
+		"instance_id", h.InstanceID)
+
+	return nil
+}
+
+// StartCleanupTask 启动清理任务
+func (h *Hub) StartCleanupTask(ctx context.Context) {
+	h.cleanupTicker = time.NewTicker(10 * time.Second)
+	h.wg.Add(1)
+
+	go func() {
+		defer h.wg.Done()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-h.cleanupTicker.C:
+				// 清理本地缓存
+				if h.RedisClient != nil {
+					h.RedisClient.CleanupLocalCache()
+				}
+				// 刷新本实例所有用户的 TTL
+				h.RefreshLocalUsersTTL(ctx)
+			}
+		}
+	}()
+}
+
+// RefreshLocalUsersTTL 刷新本实例所有在线用户的 TTL
+func (h *Hub) RefreshLocalUsersTTL(ctx context.Context) {
+	h.mu.RLock()
+	userIDs := make([]string, 0, len(h.UserConns))
+	for userID := range h.UserConns {
+		userIDs = append(userIDs, userID)
+	}
+	h.mu.RUnlock()
+
+	for _, userID := range userIDs {
+		if h.RedisClient != nil {
+			h.RedisClient.RefreshUserTTL(ctx, userID, h.PresenceTTL)
+		}
+	}
+}
+
+// StopCleanupTask 停止清理任务
+func (h *Hub) StopCleanupTask() {
+	if h.cleanupTicker != nil {
+		h.cleanupTicker.Stop()
 	}
 }
 
@@ -154,6 +233,19 @@ func (h *Hub) Run(ctx context.Context) {
 				"conn_id", conn.ID,
 				"user_id", conn.UserID)
 
+			// 同步到 Redis（用户上线）
+			if conn.UserID != "" && h.RedisClient != nil {
+				go func() {
+					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					defer cancel()
+					if err := h.RedisClient.SetUserOnline(ctx, conn.UserID, conn.ID, h.PresenceTTL); err != nil {
+						logger.Error("Failed to set user online in Redis",
+							"user_id", conn.UserID,
+							"error", err)
+					}
+				}()
+			}
+
 		case conn := <-h.Unregister:
 			h.mu.Lock()
 			if _, ok := h.Connections[conn.ID]; ok {
@@ -171,6 +263,19 @@ func (h *Hub) Run(ctx context.Context) {
 			logger.Info("Connection unregistered",
 				"conn_id", conn.ID,
 				"user_id", conn.UserID)
+
+			// 同步到 Redis（用户下线）
+			if conn.UserID != "" && h.RedisClient != nil {
+				go func() {
+					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					defer cancel()
+					if err := h.RedisClient.SetUserOffline(ctx, conn.UserID); err != nil {
+						logger.Error("Failed to set user offline in Redis",
+							"user_id", conn.UserID,
+							"error", err)
+					}
+				}()
+			}
 		}
 	}
 }
@@ -468,14 +573,14 @@ func (h *Hub) GetUserConnections(userID string) []*Connection {
 	return result
 }
 
-// SendToUser 发送消息给指定用户
+// SendToUser 发送消息给指定用户（本地投递）
 func (h *Hub) SendToUser(userID string, message []byte) {
 	h.mu.RLock()
 	conns, ok := h.UserConns[userID]
 	h.mu.RUnlock()
 
 	if !ok {
-		logger.Debug("User not connected",
+		logger.Debug("User not connected locally",
 			"user_id", userID)
 		return
 	}
@@ -489,6 +594,126 @@ func (h *Hub) SendToUser(userID string, message []byte) {
 				"conn_id", conn.ID)
 		}
 	}
+}
+
+// RouteMessage 路由消息（多实例策略）
+// 返回值: 是否投递成功（本地或 Redis 状态），shouldStore 是否需要落库
+func (h *Hub) RouteMessage(ctx context.Context, userID string, message []byte) (delivered bool, shouldStore bool, err error) {
+	// 先检查本地是否有连接
+	h.mu.RLock()
+	conns, localExists := h.UserConns[userID]
+	h.mu.RUnlock()
+
+	if localExists && len(conns) > 0 {
+		// 本地有连接，直接投递
+		h.SendToUser(userID, message)
+		logger.Debug("Message delivered locally",
+			"user_id", userID)
+		return true, false, nil
+	}
+
+	// 本地无连接，检查 Redis 获取其他实例的连接信息
+	if h.RedisClient == nil {
+		// 无 Redis，需要落库
+		return false, true, nil
+	}
+
+	presence, err := h.RedisClient.GetUserPresence(ctx, userID)
+	if err != nil {
+		logger.Error("Failed to get user presence from Redis",
+			"user_id", userID,
+			"error", err)
+		return false, true, err
+	}
+
+	if presence == nil {
+		// 用户离线，需要落库
+		logger.Debug("User offline, need to store message",
+			"user_id", userID)
+		return false, true, nil
+	}
+
+	// 用户在其他实例在线
+	logger.Info("User online on other instance",
+		"user_id", userID,
+		"instance_id", presence.InstanceID,
+		"conn_id", presence.ConnID)
+
+	// TODO: 后续实现跨实例消息投递（通过 Kafka 或 RPC）
+	// 当前版本：需要落库，用户重连后拉取
+	return false, true, nil
+}
+
+// IsUserOnline 检查用户是否在线（本地优先，Redis 补充）
+func (h *Hub) IsUserOnline(ctx context.Context, userID string) (bool, error) {
+	// 先检查本地
+	h.mu.RLock()
+	_, localExists := h.UserConns[userID]
+	h.mu.RUnlock()
+
+	if localExists {
+		return true, nil
+	}
+
+	// 检查 Redis
+	if h.RedisClient == nil {
+		return false, nil
+	}
+
+	return h.RedisClient.IsUserOnline(ctx, userID)
+}
+
+// GetUserPresence 获取用户在线状态信息
+func (h *Hub) GetUserPresence(ctx context.Context, userID string) (*redis.UserPresence, error) {
+	// 先检查本地
+	h.mu.RLock()
+	conns, localExists := h.UserConns[userID]
+	h.mu.RUnlock()
+
+	if localExists && len(conns) > 0 {
+		// 本地有连接，构建本地状态
+		for connID := range conns {
+			return &redis.UserPresence{
+				UserID:     userID,
+				InstanceID: h.InstanceID,
+				ConnID:     connID,
+				TTL:        h.PresenceTTL,
+				UpdatedAt:  time.Now().UnixMilli(),
+			}, nil
+		}
+	}
+
+	// 从 Redis 获取
+	if h.RedisClient == nil {
+		return nil, nil
+	}
+
+	return h.RedisClient.GetUserPresence(ctx, userID)
+}
+
+// GetOnlineUsers 获取所有在线用户（本地 + Redis）
+func (h *Hub) GetOnlineUsers(ctx context.Context) ([]string, error) {
+	if h.RedisClient == nil {
+		// 仅返回本地用户
+		h.mu.RLock()
+		userIDs := make([]string, 0, len(h.UserConns))
+		for userID := range h.UserConns {
+			userIDs = append(userIDs, userID)
+		}
+		h.mu.RUnlock()
+		return userIDs, nil
+	}
+
+	presences, err := h.RedisClient.GetOnlineUsers(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	userIDs := make([]string, 0, len(presences))
+	for _, p := range presences {
+		userIDs = append(userIDs, p.UserID)
+	}
+	return userIDs, nil
 }
 
 // GetStats 获取 Hub 统计信息

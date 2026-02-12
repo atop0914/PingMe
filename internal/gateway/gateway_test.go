@@ -3,12 +3,15 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
 
 	"PingMe/internal/config"
+	"PingMe/internal/pkg/redis"
 
+	"github.com/alicebob/miniredis/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -281,3 +284,233 @@ func TestRateLimitExceededError(t *testing.T) {
 	assert.Equal(t, "Rate limit exceeded", err.Error())
 	assert.IsType(t, &RateLimitExceededError{}, err)
 }
+
+// TestHubWithRedis tests Hub with Redis integration
+func TestHubWithRedis(t *testing.T) {
+	// Setup miniredis
+	mr, err := miniredis.Run()
+	require.NoError(t, err)
+	defer mr.Close()
+
+	cfg := getTestConfig()
+	cfg.Redis = config.RedisConfig{
+		Host:     mr.Host(),
+		Port:     6379,
+		Password: "",
+		DB:       0,
+		PoolSize: 10,
+	}
+
+	hub := NewHub(cfg)
+
+	// Initialize Redis
+	err = hub.InitRedis()
+	require.NoError(t, err)
+	assert.NotNil(t, hub.RedisClient)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go hub.Run(ctx)
+
+	// Test user online/offline sync
+	t.Run("UserOnlineOfflineSync", func(t *testing.T) {
+		conn := NewConnection("test-conn-1", nil, hub, "test-user-1")
+		conn.IsAuth.Store(true)
+
+		// Register connection (should set user online in Redis)
+		hub.Register <- conn
+		time.Sleep(100 * time.Millisecond)
+
+		// Verify user is online in Redis
+		online, err := hub.RedisClient.IsUserOnline(ctx, "test-user-1")
+		require.NoError(t, err)
+		assert.True(t, online)
+
+		// Unregister connection (should set user offline in Redis)
+		hub.Unregister <- conn
+		time.Sleep(100 * time.Millisecond)
+
+		// Verify user is offline in Redis
+		online, err = hub.RedisClient.IsUserOnline(ctx, "test-user-1")
+		require.NoError(t, err)
+		assert.False(t, online)
+	})
+
+	// Cleanup
+	hub.StopCleanupTask()
+}
+
+// TestHubRouteMessage tests message routing
+func TestHubRouteMessage(t *testing.T) {
+	mr, err := miniredis.Run()
+	require.NoError(t, err)
+	defer mr.Close()
+
+	cfg := getTestConfig()
+	cfg.Redis = config.RedisConfig{
+		Host:     mr.Host(),
+		Port:     6379,
+		Password: "",
+		DB:       0,
+		PoolSize: 10,
+	}
+
+	hub := NewHub(cfg)
+	err = hub.InitRedis()
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go hub.Run(ctx)
+
+	t.Run("RouteToLocalUser", func(t *testing.T) {
+		// Create a mock connection
+		conn := NewConnection("conn-local", nil, hub, "local-user")
+		conn.IsAuth.Store(true)
+
+		// Start message receiver
+		go func() {
+			for msg := range conn.Send {
+				_ = msg
+			}
+		}()
+
+		hub.Register <- conn
+		time.Sleep(100 * time.Millisecond)
+
+		// Route message to local user
+		testMsg := []byte(`{"type":"text","content":"hello"}`)
+		delivered, shouldStore, err := hub.RouteMessage(ctx, "local-user", testMsg)
+
+		assert.NoError(t, err)
+		assert.True(t, delivered)
+		assert.False(t, shouldStore)
+	})
+
+	t.Run("RouteToOfflineUser", func(t *testing.T) {
+		// Route message to offline user
+		testMsg := []byte(`{"type":"text","content":"hello"}`)
+		delivered, shouldStore, err := hub.RouteMessage(ctx, "offline-user", testMsg)
+
+		assert.NoError(t, err)
+		assert.False(t, delivered)
+		assert.True(t, shouldStore)
+	})
+
+	hub.StopCleanupTask()
+}
+
+// TestHubIsUserOnline tests IsUserOnline method
+func TestHubIsUserOnline(t *testing.T) {
+	mr, err := miniredis.Run()
+	require.NoError(t, err)
+	defer mr.Close()
+
+	cfg := getTestConfig()
+	cfg.Redis = config.RedisConfig{
+		Host:     mr.Host(),
+		Port:     6379,
+		Password: "",
+		DB:       0,
+		PoolSize: 10,
+	}
+
+	hub := NewHub(cfg)
+	err = hub.InitRedis()
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go hub.Run(ctx)
+
+	t.Run("LocalUserOnline", func(t *testing.T) {
+		conn := NewConnection("conn-online", nil, hub, "online-user")
+		conn.IsAuth.Store(true)
+
+		hub.Register <- conn
+		time.Sleep(100 * time.Millisecond)
+
+		online, err := hub.IsUserOnline(ctx, "online-user")
+		assert.NoError(t, err)
+		assert.True(t, online)
+	})
+
+	t.Run("UserOffline", func(t *testing.T) {
+		online, err := hub.IsUserOnline(ctx, "nonexistent-user")
+		assert.NoError(t, err)
+		assert.False(t, online)
+	})
+
+	hub.StopCleanupTask()
+}
+
+// TestHubGetOnlineUsers tests GetOnlineUsers method
+func TestHubGetOnlineUsers(t *testing.T) {
+	mr, err := miniredis.Run()
+	require.NoError(t, err)
+	defer mr.Close()
+
+	cfg := getTestConfig()
+	cfg.Redis = config.RedisConfig{
+		Host:     mr.Host(),
+		Port:     6379,
+		Password: "",
+		DB:       0,
+		PoolSize: 10,
+	}
+
+	hub := NewHub(cfg)
+	err = hub.InitRedis()
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go hub.Run(ctx)
+
+	// Register multiple connections for different users
+	users := []string{"user-1", "user-2", "user-3"}
+	for i, userID := range users {
+		conn := NewConnection(fmt.Sprintf("conn-%d", i), nil, hub, userID)
+		conn.IsAuth.Store(true)
+		hub.Register <- conn
+	}
+
+	time.Sleep(200 * time.Millisecond)
+
+	// Get all online users
+	onlineUsers, err := hub.GetOnlineUsers(ctx)
+	assert.NoError(t, err)
+	assert.Len(t, onlineUsers, 3)
+
+	hub.StopCleanupTask()
+}
+
+// TestUserPresenceSerialization tests UserPresence JSON serialization
+func TestUserPresenceSerialization(t *testing.T) {
+	presence := &redis.UserPresence{
+		UserID:     "test-user",
+		InstanceID: "instance-1",
+		ConnID:     "conn-123",
+		TTL:        30,
+		UpdatedAt:  time.Now().UnixMilli(),
+	}
+
+	// Serialize
+	data, err := json.Marshal(presence)
+	require.NoError(t, err)
+
+	// Deserialize
+	var decoded redis.UserPresence
+	err = json.Unmarshal(data, &decoded)
+	require.NoError(t, err)
+
+	assert.Equal(t, presence.UserID, decoded.UserID)
+	assert.Equal(t, presence.InstanceID, decoded.InstanceID)
+	assert.Equal(t, presence.ConnID, decoded.ConnID)
+	assert.Equal(t, presence.TTL, decoded.TTL)
+}
+

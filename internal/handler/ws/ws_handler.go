@@ -3,7 +3,6 @@ package ws
 import (
 	"PingMe/internal/config"
 	"PingMe/internal/gateway"
-	"context"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
@@ -15,10 +14,7 @@ type Handler struct {
 }
 
 // NewHandler creates a new WebSocket handler
-func NewHandler(cfg *config.Config) *Handler {
-	hub := gateway.NewHub(cfg)
-	go hub.Run(context.Background())
-
+func NewHandler(cfg *config.Config, hub *gateway.Hub) *Handler {
 	return &Handler{
 		Hub: hub,
 	}
