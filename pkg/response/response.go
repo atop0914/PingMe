@@ -4,6 +4,8 @@ import (
 	"net/http"
 
 	"PingMe/internal/errorcode"
+
+	"github.com/gin-gonic/gin"
 )
 
 // Response represents a standard API response
@@ -46,4 +48,21 @@ func FailWithMessage(msg string, code int) Response {
 		Code:    code,
 		Message: msg,
 	}
+}
+
+// Error returns an error response with code and message (for gin context)
+func Error(c *gin.Context, code int, message string) {
+	c.JSON(code, Response{
+		Code:    code,
+		Message: message,
+	})
+}
+
+// SuccessGin returns a success response (for gin context)
+func SuccessGin(c *gin.Context, data interface{}) {
+	c.JSON(http.StatusOK, Response{
+		Code:    0,
+		Message: "success",
+		Data:    map[string]interface{}{"data": data},
+	})
 }

@@ -12,6 +12,7 @@ import (
 
 	"PingMe/internal/config"
 	"PingMe/internal/logger"
+	"PingMe/internal/model/message"
 	"PingMe/internal/model/user"
 	"PingMe/internal/pkg/redis"
 
@@ -33,13 +34,15 @@ var upgrader = websocket.Upgrader{
 type MessageType string
 
 const (
-	MsgTypePing    MessageType = "ping"
-	MsgTypePong    MessageType = "pong"
-	MsgTypeText    MessageType = "text"
-	MsgTypeError   MessageType = "error"
-	MsgTypeAuth    MessageType = "auth"
-	MsgTypeAuthOK  MessageType = "auth_ok"
-	MsgTypeAuthFail MessageType = "auth_fail"
+	MsgTypePing       MessageType = "ping"
+	MsgTypePong       MessageType = "pong"
+	MsgTypeText       MessageType = "text"
+	MsgTypeError      MessageType = "error"
+	MsgTypeAuth       MessageType = "auth"
+	MsgTypeAuthOK     MessageType = "auth_ok"
+	MsgTypeAuthFail   MessageType = "auth_fail"
+	MsgTypeMessage    MessageType = "message" // 收到消息推送
+	MsgTypeMessageACK MessageType = "message_ack" // 消息发送结果确认
 )
 
 // BaseMessage 基础消息结构
@@ -50,6 +53,7 @@ type BaseMessage struct {
 
 // TextMessage 文本消息
 type TextMessage struct {
+	ToUserID string `json:"to_user_id"`
 	Content   string `json:"content"`
 	MsgID     string `json:"msg_id"`
 	Timestamp int64  `json:"timestamp"`
@@ -85,6 +89,11 @@ type Hub struct {
 	mu          sync.RWMutex
 	Config      *config.Config
 	wg          sync.WaitGroup
+
+	// 消息服务（可选，用于通过 WS 发送消息）
+	MessageService interface {
+		SendMessage(ctx context.Context, fromUserID string, req *message.SendMessageRequest) (*message.SendMessageResponse, error)
+	}
 
 	// Redis 在线状态管理
 	RedisClient     *redis.Client
@@ -536,7 +545,46 @@ func (c *Connection) handleText(data []byte) {
 		"user_id", c.UserID,
 		"content", textMsg.Content)
 
-	// TODO: 后续 Day 4-5 实现消息投递到 Kafka
+	// 如果 Hub 有消息服务，通过服务发送
+	if c.Hub.MessageService != nil {
+		req := &message.SendMessageRequest{
+			ToUserID:   textMsg.ToUserID,
+			Content:    textMsg.Content,
+			ContentType: message.MsgContentTypeText,
+			ClientTS:   textMsg.Timestamp,
+		}
+
+		resp, err := c.Hub.MessageService.SendMessage(context.Background(), c.UserID, req)
+		if err != nil {
+			logger.Error("Failed to send message via service",
+				"from_user_id", c.UserID,
+				"error", err)
+			// 发送失败消息给客户端
+			errorMsg := BaseMessage{
+				Type: MsgTypeError,
+				Payload: ErrorMessage{
+					Code:    500,
+					Message: "Failed to send message: " + err.Error(),
+				},
+			}
+			errorData, _ := json.Marshal(errorMsg)
+			c.Send <- errorData
+			return
+		}
+
+		// 发送成功响应
+		ackMsg := BaseMessage{
+			Type: MsgTypeMessageACK,
+			Payload: map[string]interface{}{
+				"msg_id":          resp.MsgID,
+				"conversation_id": resp.ConversationID,
+				"status":          resp.Status,
+				"server_ts":       resp.ServerTS,
+			},
+		}
+		ackData, _ := json.Marshal(ackMsg)
+		c.Send <- ackData
+	}
 }
 
 // validateToken 验证 JWT token

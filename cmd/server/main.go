@@ -20,7 +20,9 @@ import (
 	"PingMe/internal/pkg/database"
 	"PingMe/internal/pkg/jwt"
 	userrepo "PingMe/internal/repository/user"
+	msgrepo "PingMe/internal/repository/message"
 	"PingMe/internal/service"
+	msghandler "PingMe/internal/handler/message"
 	"PingMe/pkg/response"
 
 	"github.com/gin-gonic/gin"
@@ -53,6 +55,7 @@ func main() {
 
 	// Initialize repositories
 	userRepo := userrepo.NewRepository(db)
+	msgRepo := msgrepo.NewRepository(db)
 
 	// Initialize user schema
 	if err := userRepo.InitSchema(); err != nil {
@@ -61,16 +64,14 @@ func main() {
 	}
 	logger.Info("User schema initialized")
 
-	// Initialize services
-	jwtSvc := jwt.NewTokenService(&cfg.JWT)
-	userSvc := service.NewService(userRepo, jwtSvc)
+	// Initialize message schema
+	if err := msgRepo.InitSchema(); err != nil {
+		logger.Error("Failed to initialize message schema", "error", err)
+		os.Exit(1)
+	}
+	logger.Info("Message schema initialized")
 
-	// Initialize handlers
-	baseHandler := handler.NewHandler(cfg)
-	authHandler := auth.NewHandler(userSvc)
-	userHandler := userprofile.NewHandler(userSvc)
-
-	// Initialize WebSocket hub first (before wsHandler)
+	// Initialize WebSocket hub first (before initializing services that depend on it)
 	hub := gateway.NewHub(cfg)
 
 	// Initialize Redis client for online status
@@ -79,6 +80,20 @@ func main() {
 			"error", err)
 		// Continue without Redis - online status won't be shared across instances
 	}
+
+	// Initialize services
+	jwtSvc := jwt.NewTokenService(&cfg.JWT)
+	userSvc := service.NewService(userRepo, jwtSvc)
+	msgSvc := service.NewMessageService(msgRepo, userRepo, hub)
+
+	// 设置消息服务到 Hub（用于通过 WS 发送消息）
+	hub.MessageService = msgSvc
+
+	// Initialize handlers
+	baseHandler := handler.NewHandler(cfg)
+	authHandler := auth.NewHandler(userSvc)
+	userHandler := userprofile.NewHandler(userSvc)
+	messageHandler := msghandler.NewMessageHandler(msgSvc)
 
 	wsHandler := ws.NewHandler(cfg, hub)
 
@@ -107,10 +122,10 @@ func main() {
 	v1 := r.Group("/api/v1")
 	{
 		// Auth routes (no auth required)
-		auth := v1.Group("/auth")
+		authRoutes := v1.Group("/auth")
 		{
-			auth.POST("/register", authHandler.Register)
-			auth.POST("/login", authHandler.Login)
+			authRoutes.POST("/register", authHandler.Register)
+			authRoutes.POST("/login", authHandler.Login)
 		}
 
 		// User routes (auth required)
@@ -119,6 +134,23 @@ func main() {
 		{
 			userRoutes.GET("/profile", userHandler.GetProfile)
 			userRoutes.PUT("/profile", userHandler.UpdateProfile)
+		}
+
+		// Message routes (auth required)
+		messageRoutes := v1.Group("/messages")
+		messageRoutes.Use(middleware.AuthMiddleware(jwtSvc))
+		{
+			messageRoutes.POST("", messageHandler.SendMessage)          // 发送消息
+			messageRoutes.GET("/history", messageHandler.GetHistory)    // 获取历史消息
+			messageRoutes.GET("/offline", messageHandler.PullOfflineMessages) // 拉取离线消息
+		}
+
+		// Conversation routes (auth required)
+		conversationRoutes := v1.Group("/conversations")
+		conversationRoutes.Use(middleware.AuthMiddleware(jwtSvc))
+		{
+			conversationRoutes.GET("", messageHandler.GetConversations)       // 获取会话列表
+			conversationRoutes.GET("/:id", messageHandler.GetConversation)   // 获取会话详情
 		}
 	}
 
