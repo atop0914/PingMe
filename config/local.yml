@@ -10,7 +10,7 @@ database:
   host: "localhost"
   port: 3306
   username: "root"
-  password: "root"
+  password: "root123"
   name: "im"
   max_open_conns: 25
   max_idle_conns: 5

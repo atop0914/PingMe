@@ -39,7 +39,7 @@ const (
 type Message struct {
 	ID             uint           `json:"id" gorm:"primaryKey"`
 	MsgID          string         `json:"msg_id" gorm:"type:varchar(64);uniqueIndex;not null"`
-	ConversationID string         `json:"conversation_id" gorm:"type:varchar(64);index;not null"`
+	ConversationID string         `json:"conversation_id" gorm:"type:varchar(128);index;not null"`
 	FromUserID     string         `json:"from_user_id" gorm:"type:varchar(36);index;not null"`
 	ToUserID       string         `json:"to_user_id" gorm:"type:varchar(36);index"` // 单聊时为目标用户ID
 	GroupID        string         `json:"group_id" gorm:"type:varchar(36);index"`    // 群聊时为群ID
@@ -55,7 +55,7 @@ type Message struct {
 // Conversation 会话模型
 type Conversation struct {
 	ID             uint              `json:"id" gorm:"primaryKey"`
-	ConversationID string           `json:"conversation_id" gorm:"type:varchar(64);uniqueIndex;not null"`
+	ConversationID string           `json:"conversation_id" gorm:"type:varchar(128);uniqueIndex;not null"`
 	Type           ConversationType `json:"type" gorm:"type:varchar(20);not null"`
 	Name           string            `json:"name" gorm:"type:varchar(100)"` // 群名称
 	OwnerUserID    string            `json:"owner_user_id" gorm:"type:varchar(36)"` // 群主
@@ -67,7 +67,7 @@ type Conversation struct {
 // ConversationMember 会话成员
 type ConversationMember struct {
 	ID             uint      `json:"id" gorm:"primaryKey"`
-	ConversationID string   `json:"conversation_id" gorm:"type:varchar(64);index;not null"`
+	ConversationID string   `json:"conversation_id" gorm:"type:varchar(128);index;not null"`
 	UserID         string   `json:"user_id" gorm:"type:varchar(36);index;not null"`
 	Role           string   `json:"role" gorm:"type:varchar(20);default:member"` // owner/admin/member
 	JoinedAt       time.Time `json:"joined_at"`
