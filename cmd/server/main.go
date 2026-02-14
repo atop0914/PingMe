@@ -4,10 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
-	"os/signal"
-	"syscall"
-	"time"
 
 	"PingMe/internal/config"
 	"PingMe/internal/gateway"
@@ -162,54 +160,32 @@ func main() {
 	// Create context for hub
 	ctx, cancel := context.WithCancel(context.Background())
 
-	// Start hub with context
-	hub.Run(ctx)
+	// Start hub with context (后台运行)
+	go hub.Run(ctx)
 
 	// Start cleanup task for online status
 	if hub.RedisClient != nil {
-		hub.StartCleanupTask(ctx)
+		go hub.StartCleanupTask(ctx)
 	}
 
-	// Graceful shutdown
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-
-	go func() {
-		addr := fmt.Sprintf("%s:%d", cfg.App.Host, cfg.App.Port)
-		logger.Info("Server listening", "address", addr)
-		if err := r.Run(addr); err != nil {
-			logger.Error("Server failed to start", "error", err)
-			os.Exit(1)
-		}
-	}()
-
-	<-quit
-	logger.Info("Shutting down server...")
-
-	// Stop cleanup task
-	hub.StopCleanupTask()
-
-	// Stop message deduplicator
-	if hub.Deduplicator != nil {
-		hub.Deduplicator.Stop()
+	// 直接在主线程启动 HTTP 服务器
+	addr := fmt.Sprintf("%s:%d", cfg.App.Host, cfg.App.Port)
+	logger.Info("Server listening", "address", addr)
+	
+	srv := &http.Server{
+		Addr:    addr,
+		Handler: r,
 	}
-
-	// Cancel hub context
+	
+	// 阻塞直到服务器出错
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		logger.Error("Server failed to start", "error", err)
+	}
+	
+	// 关闭
 	cancel()
-
-	// Close Redis client
 	if hub.RedisClient != nil {
 		hub.RedisClient.Close()
 	}
-
-	// Send signal to shutdown hub
-	hubCtx, hubCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer hubCancel()
-
-	// Wait for hub to shutdown
-	select {
-	case <-hubCtx.Done():
-	}
-
 	logger.Info("Server shutdown complete")
 }

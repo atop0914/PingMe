@@ -30,20 +30,32 @@ func Init(cfg *config.DatabaseConfig) (*gorm.DB, error) {
 
 	if DB == nil {
 		var err error
+		
+		// 添加 5 秒超时控制
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		
+		// 使用带超时的 dialector
 		DB, err = gorm.Open(mysql.Open(dsn), gormConfig)
 		if err != nil {
 			return nil, fmt.Errorf("failed to connect to database: %w", err)
 		}
 
-		// Configure connection pool
+		// 测试连接是否可用
 		sqlDB, err := DB.DB()
 		if err != nil {
 			return nil, fmt.Errorf("failed to get underlying sql.DB: %w", err)
 		}
-
+		
+		// 设置连接池参数
 		sqlDB.SetMaxOpenConns(cfg.MaxOpenConns)
 		sqlDB.SetMaxIdleConns(cfg.MaxIdleConns)
 		sqlDB.SetConnMaxLifetime(cfg.ConnMaxLifetimeDuration())
+		
+		// 使用 PingContext 测试连接
+		if err := sqlDB.PingContext(ctx); err != nil {
+			return nil, fmt.Errorf("failed to ping database: %w", err)
+		}
 	}
 
 	return DB, nil
