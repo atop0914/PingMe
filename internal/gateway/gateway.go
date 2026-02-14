@@ -34,15 +34,19 @@ var upgrader = websocket.Upgrader{
 type MessageType string
 
 const (
-	MsgTypePing       MessageType = "ping"
-	MsgTypePong       MessageType = "pong"
-	MsgTypeText       MessageType = "text"
-	MsgTypeError      MessageType = "error"
-	MsgTypeAuth       MessageType = "auth"
-	MsgTypeAuthOK     MessageType = "auth_ok"
-	MsgTypeAuthFail   MessageType = "auth_fail"
-	MsgTypeMessage    MessageType = "message" // 收到消息推送
-	MsgTypeMessageACK MessageType = "message_ack" // 消息发送结果确认
+	MsgTypePing          MessageType = "ping"
+	MsgTypePong          MessageType = "pong"
+	MsgTypeText          MessageType = "text"
+	MsgTypeError         MessageType = "error"
+	MsgTypeAuth          MessageType = "auth"
+	MsgTypeAuthOK        MessageType = "auth_ok"
+	MsgTypeAuthFail      MessageType = "auth_fail"
+	MsgTypeMessage       MessageType = "message"        // 收到消息推送
+	MsgTypeMessageACK   MessageType = "message_ack"    // 消息发送结果确认
+	MsgTypePullOffline  MessageType = "pull_offline"   // 拉取离线消息请求
+	MsgTypeOfflineMsgs  MessageType = "offline_msgs"    // 离线消息响应
+	MsgTypeSyncCursor   MessageType = "sync_cursor"    // 同步游标
+	MsgTypeReconnect    MessageType = "reconnect"      // 重连通知
 )
 
 // BaseMessage 基础消息结构
@@ -67,16 +71,16 @@ type ErrorMessage struct {
 
 // Connection WebSocket 连接
 type Connection struct {
-	ID        string
-	UserID    string
-	Socket    *websocket.Conn
-	Hub       *Hub
-	Send      chan []byte
-	IsAuth    atomic.Bool
+	ID          string
+	UserID      string
+	Socket      *websocket.Conn
+	Hub         *Hub
+	Send        chan []byte
+	IsAuth      atomic.Bool
 	RateLimiter *RateLimiter
-	CreatedAt time.Time
-	LastActive time.Time
-	mu        sync.Mutex
+	CreatedAt   time.Time
+	LastActive  atomic.Int64 // 上次活跃时间（毫秒时间戳）
+	mu          sync.Mutex
 }
 
 // Hub 管理所有连接
@@ -93,13 +97,21 @@ type Hub struct {
 	// 消息服务（可选，用于通过 WS 发送消息）
 	MessageService interface {
 		SendMessage(ctx context.Context, fromUserID string, req *message.SendMessageRequest) (*message.SendMessageResponse, error)
+		// 拉取离线消息
+		PullOfflineMessages(ctx context.Context, userID string, lastTS int64, limit int) ([]message.Message, error)
 	}
 
 	// Redis 在线状态管理
 	RedisClient     *redis.Client
 	InstanceID      string
 	PresenceTTL     int // 在线状态 TTL（秒）
-	cleanupTicker   *time.Ticker
+	cleanupTicker  *time.Ticker
+	heartbeatTicker *time.Ticker // 心跳检测定时器
+
+	// 消息去重
+	Deduplicator *MessageDeduplicator
+	// 游标管理
+	CursorManager *CursorManager
 }
 
 // RateLimiter 连接级别限流器
@@ -136,7 +148,7 @@ func NewHub(cfg *config.Config) *Hub {
 		instanceID = fmt.Sprintf("%s-%s", hostname, uuid.New().String()[:8])
 	}
 
-	return &Hub{
+	hub := &Hub{
 		Connections: make(map[string]*Connection),
 		UserConns:   make(map[string]map[string]*Connection),
 		Broadcast:   make(chan []byte, 256),
@@ -146,6 +158,12 @@ func NewHub(cfg *config.Config) *Hub {
 		InstanceID:  instanceID,
 		PresenceTTL: 30, // 默认 30 秒
 	}
+
+	// 初始化去重器和游标管理器
+	hub.Deduplicator = NewMessageDeduplicator()
+	hub.CursorManager = NewCursorManager()
+
+	return hub
 }
 
 // InitRedis 初始化 Redis 客户端
@@ -166,6 +184,7 @@ func (h *Hub) InitRedis() error {
 // StartCleanupTask 启动清理任务
 func (h *Hub) StartCleanupTask(ctx context.Context) {
 	h.cleanupTicker = time.NewTicker(10 * time.Second)
+	h.heartbeatTicker = time.NewTicker(5 * time.Second) // 每5秒检查一次心跳
 	h.wg.Add(1)
 
 	go func() {
@@ -181,6 +200,9 @@ func (h *Hub) StartCleanupTask(ctx context.Context) {
 				}
 				// 刷新本实例所有用户的 TTL
 				h.RefreshLocalUsersTTL(ctx)
+			case <-h.heartbeatTicker.C:
+				// 检查心跳超时
+				h.checkHeartbeatTimeout()
 			}
 		}
 	}()
@@ -206,6 +228,54 @@ func (h *Hub) RefreshLocalUsersTTL(ctx context.Context) {
 func (h *Hub) StopCleanupTask() {
 	if h.cleanupTicker != nil {
 		h.cleanupTicker.Stop()
+	}
+	if h.heartbeatTicker != nil {
+		h.heartbeatTicker.Stop()
+	}
+}
+
+// checkHeartbeatTimeout 检查心跳超时并断开超时连接
+func (h *Hub) checkHeartbeatTimeout() {
+	pongTimeout := time.Duration(h.Config.WebSocket.PongTimeout) * time.Second
+	now := time.Now()
+
+	h.mu.RLock()
+	// 复制一份连接列表避免锁竞争
+	timeoutConns := make([]*Connection, 0)
+	for _, conn := range h.Connections {
+		lastActive := conn.LastActive.Load()
+		if lastActive > 0 {
+			lastTime := time.UnixMilli(lastActive)
+			if now.Sub(lastTime) > pongTimeout {
+				timeoutConns = append(timeoutConns, conn)
+			}
+		}
+	}
+	h.mu.RUnlock()
+
+	// 断开超时的连接
+	for _, conn := range timeoutConns {
+		logger.Warn("Connection heartbeat timeout",
+			"conn_id", conn.ID,
+			"user_id", conn.UserID,
+			"last_active", conn.LastActive.Load())
+
+		// 发送超时消息
+		errorMsg := BaseMessage{
+			Type: MsgTypeError,
+			Payload: ErrorMessage{
+				Code:    408,
+				Message: "Heartbeat timeout, connection closed",
+			},
+		}
+		errorData, _ := json.Marshal(errorMsg)
+		select {
+		case conn.Send <- errorData:
+		default:
+		}
+
+		// 关闭连接（这会触发 ReadPump 退出）
+		conn.Socket.Close()
 	}
 }
 
@@ -291,7 +361,7 @@ func (h *Hub) Run(ctx context.Context) {
 
 // NewConnection 创建新连接
 func NewConnection(id string, socket *websocket.Conn, hub *Hub, userID string) *Connection {
-	return &Connection{
+	c := &Connection{
 		ID:          id,
 		UserID:      userID,
 		Socket:      socket,
@@ -300,8 +370,9 @@ func NewConnection(id string, socket *websocket.Conn, hub *Hub, userID string) *
 		IsAuth:      atomic.Bool{},
 		RateLimiter: NewRateLimiter(10, hub.Config.WebSocket.MaxMessageSize), // 10 messages/sec
 		CreatedAt:   time.Now(),
-		LastActive:  time.Now(),
 	}
+	c.LastActive.Store(time.Now().UnixMilli())
+	return c
 }
 
 // NewRateLimiter 创建限流器
@@ -386,9 +457,12 @@ func (c *Connection) ReadPump() {
 	c.Socket.SetReadDeadline(time.Now().Add(time.Duration(c.Hub.Config.WebSocket.PongTimeout) * time.Second))
 	c.Socket.SetPongHandler(func(string) error {
 		c.Socket.SetReadDeadline(time.Now().Add(time.Duration(c.Hub.Config.WebSocket.PongTimeout) * time.Second))
-		c.LastActive = time.Now()
+		c.LastActive.Store(time.Now().UnixMilli())
 		return nil
 	})
+
+	// 初始化最后活跃时间
+	c.LastActive.Store(time.Now().UnixMilli())
 
 	for {
 		_, message, err := c.Socket.ReadMessage()
@@ -401,7 +475,8 @@ func (c *Connection) ReadPump() {
 			break
 		}
 
-		c.LastActive = time.Now()
+		// 更新最后活跃时间
+		c.LastActive.Store(time.Now().UnixMilli())
 
 		// 限流检查
 		if err := c.RateLimiter.Allow(int64(len(message))); err != nil {
@@ -439,6 +514,10 @@ func (c *Connection) handleMessage(data []byte) {
 		c.handlePing()
 	case MsgTypeText:
 		c.handleText(data)
+	case MsgTypePullOffline:
+		c.handlePullOffline(data)
+	case MsgTypeSyncCursor:
+		c.handleSyncCursor(data)
 	default:
 		logger.Warn("Unknown message type",
 			"conn_id", c.ID,
@@ -468,13 +547,16 @@ func (c *Connection) handleAuth(data []byte) {
 	}
 
 	c.mu.Lock()
+	oldUserID := c.UserID
 	c.UserID = claims.UserID
 	c.IsAuth.Store(true)
 	c.mu.Unlock()
 
-	// 重新注册到 Hub（带上 userID）
-	c.Hub.Unregister <- c
-	c.Hub.Register <- c
+	// 如果用户ID变化，重新注册到 Hub
+	if oldUserID != c.UserID {
+		c.Hub.Unregister <- c
+		c.Hub.Register <- c
+	}
 
 	// 发送认证成功
 	authOK := BaseMessage{
@@ -490,6 +572,198 @@ func (c *Connection) handleAuth(data []byte) {
 	logger.Info("Client authenticated",
 		"conn_id", c.ID,
 		"user_id", c.UserID)
+
+	// 自动拉取离线消息
+	c.sendOfflineMessages()
+}
+
+// sendOfflineMessages 自动发送离线消息
+func (c *Connection) sendOfflineMessages() {
+	if c.Hub.MessageService == nil {
+		return
+	}
+
+	// 获取用户游标
+	cursor := c.Hub.CursorManager.GetCursor(c.UserID, "")
+	lastTS := int64(0)
+	if cursor != nil {
+		lastTS = cursor.LastMsgTS
+	}
+
+	// 拉取离线消息
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	msgs, err := c.Hub.MessageService.PullOfflineMessages(ctx, c.UserID, lastTS, 50)
+	if err != nil {
+		logger.Error("Failed to pull offline messages",
+			"user_id", c.UserID,
+			"error", err)
+		return
+	}
+
+	if len(msgs) == 0 {
+		return
+	}
+
+	// 发送离线消息
+	offlineMsg := BaseMessage{
+		Type: MsgTypeOfflineMsgs,
+		Payload: map[string]interface{}{
+			"messages": msgs,
+			"count":    len(msgs),
+		},
+	}
+	offlineData, _ := json.Marshal(offlineMsg)
+	c.Send <- offlineData
+
+	// 更新游标
+	if len(msgs) > 0 {
+		lastMsg := msgs[len(msgs)-1]
+		c.Hub.CursorManager.UpdateCursor(c.UserID, "", &ConversationCursor{
+			UserID:    c.UserID,
+			LastMsgID: lastMsg.MsgID,
+			LastMsgTS: lastMsg.ServerTS,
+		})
+	}
+
+	logger.Info("Sent offline messages",
+		"user_id", c.UserID,
+		"count", len(msgs))
+}
+
+// handlePullOffline 处理拉取离线消息请求
+func (c *Connection) handlePullOffline(data []byte) {
+	if !c.IsAuth.Load() {
+		c.sendError(401, "Not authenticated")
+		return
+	}
+
+	var reqMsg struct {
+		Type    MessageType `json:"type"`
+		Payload struct {
+			ConversationID string `json:"conversation_id,omitempty"`
+			LastMsgID      string `json:"last_msg_id,omitempty"`
+			LastMsgTS      int64  `json:"last_msg_ts,omitempty"`
+			Limit          int    `json:"limit"`
+		} `json:"payload"`
+	}
+
+	if err := json.Unmarshal(data, &reqMsg); err != nil {
+		c.sendError(400, "Invalid request")
+		return
+	}
+
+	// 验证参数
+	params := &GetOfflineMessagesParams{
+		UserID:         c.UserID,
+		ConversationID: reqMsg.Payload.ConversationID,
+		LastMsgID:      reqMsg.Payload.LastMsgID,
+		LastMsgTS:      reqMsg.Payload.LastMsgTS,
+		Limit:          reqMsg.Payload.Limit,
+	}
+	if err := params.Validate(); err != nil {
+		c.sendError(400, err.Error())
+		return
+	}
+
+	if c.Hub.MessageService == nil {
+		c.sendError(500, "Message service not available")
+		return
+	}
+
+	// 拉取离线消息
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// 如果指定了会话，只拉取该会话的消息
+	if params.ConversationID != "" {
+		// TODO: 实现单会话拉取
+		c.sendError(501, "Single conversation pull not implemented")
+		return
+	}
+
+	msgs, err := c.Hub.MessageService.PullOfflineMessages(ctx, c.UserID, params.LastMsgTS, params.Limit)
+	if err != nil {
+		logger.Error("Failed to pull offline messages",
+			"user_id", c.UserID,
+			"error", err)
+		c.sendError(500, "Failed to pull messages")
+		return
+	}
+
+	// 发送离线消息
+	offlineMsg := BaseMessage{
+		Type: MsgTypeOfflineMsgs,
+		Payload: map[string]interface{}{
+			"messages": msgs,
+			"count":    len(msgs),
+			"has_more": len(msgs) >= params.Limit,
+		},
+	}
+	offlineData, _ := json.Marshal(offlineMsg)
+	c.Send <- offlineData
+
+	// 更新游标
+	if len(msgs) > 0 {
+		lastMsg := msgs[len(msgs)-1]
+		c.Hub.CursorManager.UpdateCursor(c.UserID, "", &ConversationCursor{
+			UserID:    c.UserID,
+			LastMsgID: lastMsg.MsgID,
+			LastMsgTS: lastMsg.ServerTS,
+		})
+	}
+
+	logger.Debug("Pulled offline messages",
+		"user_id", c.UserID,
+		"count", len(msgs))
+}
+
+// handleSyncCursor 处理游标同步
+func (c *Connection) handleSyncCursor(data []byte) {
+	if !c.IsAuth.Load() {
+		c.sendError(401, "Not authenticated")
+		return
+	}
+
+	var reqMsg struct {
+		Type    MessageType `json:"type"`
+		Payload struct {
+			ConversationID string `json:"conversation_id"`
+			LastMsgID      string `json:"last_msg_id"`
+			LastMsgTS      int64  `json:"last_msg_ts"`
+		} `json:"payload"`
+	}
+
+	if err := json.Unmarshal(data, &reqMsg); err != nil {
+		c.sendError(400, "Invalid request")
+		return
+	}
+
+	// 更新游标
+	c.Hub.CursorManager.UpdateCursor(c.UserID, reqMsg.Payload.ConversationID, &ConversationCursor{
+		UserID:         c.UserID,
+		ConversationID: reqMsg.Payload.ConversationID,
+		LastMsgID:      reqMsg.Payload.LastMsgID,
+		LastMsgTS:      reqMsg.Payload.LastMsgTS,
+	})
+
+	logger.Debug("Cursor synced",
+		"user_id", c.UserID,
+		"conversation_id", reqMsg.Payload.ConversationID)
+}
+
+// sendError 发送错误消息
+func (c *Connection) sendError(code int, message string) {
+	errorMsg := BaseMessage{
+		Type: MsgTypeError,
+		Payload: ErrorMessage{
+			Code:    code,
+			Message: message,
+		},
+	}
+	errorData, _ := json.Marshal(errorMsg)
+	c.Send <- errorData
 }
 
 // sendAuthFail 发送认证失败消息

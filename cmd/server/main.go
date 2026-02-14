@@ -189,6 +189,11 @@ func main() {
 	// Stop cleanup task
 	hub.StopCleanupTask()
 
+	// Stop message deduplicator
+	if hub.Deduplicator != nil {
+		hub.Deduplicator.Stop()
+	}
+
 	// Cancel hub context
 	cancel()
 
