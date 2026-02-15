@@ -6,6 +6,8 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"PingMe/internal/config"
 	"PingMe/internal/gateway"
@@ -16,6 +18,7 @@ import (
 	"PingMe/internal/logger"
 	"PingMe/internal/middleware"
 	"PingMe/internal/pkg/database"
+	"PingMe/internal/pkg/kafka"
 	"PingMe/internal/pkg/jwt"
 	userrepo "PingMe/internal/repository/user"
 	msgrepo "PingMe/internal/repository/message"
@@ -79,10 +82,37 @@ func main() {
 		// Continue without Redis - online status won't be shared across instances
 	}
 
+	// Initialize Kafka producer
+	var kafkaProducer *kafka.Producer
+	kafkaConfig := kafka.NewConfig(cfg)
+	kafkaProducer, err = kafka.NewProducer(kafkaConfig)
+	if err != nil {
+		logger.Warn("Failed to initialize Kafka producer, continuing without Kafka",
+			"error", err)
+		// Continue without Kafka
+		kafkaProducer = nil
+	} else {
+		logger.Info("Kafka producer initialized successfully")
+	}
+
+	// Initialize Kafka consumer (runs in background)
+	var kafkaConsumer *kafka.Consumer
+	if kafkaProducer != nil {
+		kafkaConsumerHandler := kafka.NewKafkaMessageConsumer(msgRepo, hub)
+		kafkaConsumer, err = kafka.NewConsumer(kafkaConfig, kafkaConsumerHandler, msgRepo)
+		if err != nil {
+			logger.Warn("Failed to initialize Kafka consumer, continuing without Kafka consumer",
+				"error", err)
+		} else {
+			kafkaConsumer.Start()
+			logger.Info("Kafka consumer started successfully")
+		}
+	}
+
 	// Initialize services
 	jwtSvc := jwt.NewTokenService(&cfg.JWT)
 	userSvc := service.NewService(userRepo, jwtSvc)
-	msgSvc := service.NewMessageService(msgRepo, userRepo, hub)
+	msgSvc := service.NewMessageServiceWithKafka(msgRepo, userRepo, hub, kafkaProducer)
 
 	// 设置消息服务到 Hub（用于通过 WS 发送消息）
 	hub.MessageService = msgSvc
@@ -157,11 +187,34 @@ func main() {
 		c.JSON(404, response.FailWithMessage("not found", 404))
 	})
 
-	// Create context for hub
-	ctx, cancel := context.WithCancel(context.Background())
+	// 直接在主线程启动 HTTP 服务器
+	addr := fmt.Sprintf("%s:%d", cfg.App.Host, cfg.App.Port)
+	logger.Info("Server listening", "address", addr)
+	
+	srv := &http.Server{
+		Addr:    addr,
+		Handler: r,
+	}
+
+	// Handle shutdown signals
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-quit
+		logger.Info("Received shutdown signal")
+		srv.Close()
+	}()
 
 	// Start hub with context (后台运行)
 	go hub.Run(ctx)
+
+	// Start cleanup task for online status
+	if hub.RedisClient != nil {
+		go hub.StartCleanupTask(ctx)
+	}
+
+	// Create context for graceful shutdown
+	ctx, cancel := context.WithCancel(context.Background())
 
 	// Start cleanup task for online status
 	if hub.RedisClient != nil {
@@ -181,8 +234,21 @@ func main() {
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		logger.Error("Server failed to start", "error", err)
 	}
-	
-	// 关闭
+
+	// 优雅关闭
+	logger.Info("Shutting down server...")
+
+	// 关闭 Kafka consumer
+	if kafkaConsumer != nil {
+		kafkaConsumer.Stop()
+	}
+
+	// 关闭 Kafka producer
+	if kafkaProducer != nil {
+		kafkaProducer.Close()
+	}
+
+	// 关闭 Hub
 	cancel()
 	if hub.RedisClient != nil {
 		hub.RedisClient.Close()

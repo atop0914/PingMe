@@ -9,6 +9,7 @@ import (
 	"PingMe/internal/gateway"
 	"PingMe/internal/logger"
 	"PingMe/internal/model/message"
+	kafka2 "PingMe/internal/pkg/kafka"
 	msgrepo "PingMe/internal/repository/message"
 	"PingMe/internal/repository/user"
 
@@ -17,9 +18,10 @@ import (
 
 // MessageService 消息服务
 type MessageService struct {
-	msgRepo *msgrepo.Repository
-	userRepo *user.Repository
-	hub     *gateway.Hub
+	msgRepo     *msgrepo.Repository
+	userRepo    *user.Repository
+	hub         *gateway.Hub
+	kafkaProducer *kafka2.Producer
 }
 
 // NewMessageService 创建消息服务
@@ -28,6 +30,16 @@ func NewMessageService(msgRepo *msgrepo.Repository, userRepo *user.Repository, h
 		msgRepo:  msgRepo,
 		userRepo: userRepo,
 		hub:      hub,
+	}
+}
+
+// NewMessageServiceWithKafka 创建带 Kafka 的消息服务
+func NewMessageServiceWithKafka(msgRepo *msgrepo.Repository, userRepo *user.Repository, hub *gateway.Hub, producer *kafka2.Producer) *MessageService {
+	return &MessageService{
+		msgRepo:      msgRepo,
+		userRepo:     userRepo,
+		hub:          hub,
+		kafkaProducer: producer,
 	}
 }
 
@@ -56,23 +68,43 @@ func (s *MessageService) SendMessage(ctx context.Context, fromUserID string, req
 		ServerTS:       time.Now().UnixMilli(),
 	}
 
-	// 保存消息到数据库
-	if err := s.msgRepo.CreateMessage(msg); err != nil {
-		logger.Error("Failed to create message",
-			"error", err)
-		return nil, fmt.Errorf("failed to create message: %w", err)
-	}
+	// 如果有 Kafka producer，发送到 Kafka
+	if s.kafkaProducer != nil {
+		kafkaMsg := &kafka2.MessageData{
+			MsgID:          msg.MsgID,
+			ConversationID: msg.ConversationID,
+			FromUserID:     msg.FromUserID,
+			ToUserID:       msg.ToUserID,
+			Content:        msg.Content,
+			ContentType:    string(msg.ContentType),
+			ClientTS:       msg.ClientTS,
+			ServerTS:       msg.ServerTS,
+			Status:         string(msg.Status),
+		}
 
-	// 尝试在线实时投递
-	delivered := s.deliverMessage(ctx, req.ToUserID, msg)
-
-	// 更新消息状态
-	if delivered {
-		msg.Status = message.MsgStatusSent
+		if err := s.kafkaProducer.SendMessage(kafkaMsg); err != nil {
+			logger.Error("Failed to send message to Kafka",
+				"msg_id", msg.MsgID,
+				"error", err)
+			// Kafka 发送失败，回退到直接落库
+			if dbErr := s.msgRepo.CreateMessage(msg); dbErr != nil {
+				logger.Error("Failed to create message",
+					"error", dbErr)
+				return nil, fmt.Errorf("failed to create message: %w", dbErr)
+			}
+		} else {
+			logger.Info("Message sent to Kafka",
+				"msg_id", msg.MsgID,
+				"conversation_id", conv.ConversationID)
+		}
 	} else {
-		// 离线消息，状态保持 sending，客户端会通过拉取补齐
+		// 没有 Kafka，直接落库
+		if err := s.msgRepo.CreateMessage(msg); err != nil {
+			logger.Error("Failed to create message",
+				"error", err)
+			return nil, fmt.Errorf("failed to create message: %w", err)
+		}
 	}
-	s.msgRepo.UpdateMessageStatus(msg.MsgID, msg.Status)
 
 	// 更新会话最后活跃时间
 	s.msgRepo.UpdateConversationTime(conv.ConversationID)
@@ -80,8 +112,7 @@ func (s *MessageService) SendMessage(ctx context.Context, fromUserID string, req
 	logger.Info("Message sent",
 		"msg_id", msg.MsgID,
 		"from_user_id", fromUserID,
-		"to_user_id", req.ToUserID,
-		"delivered", delivered)
+		"to_user_id", req.ToUserID)
 
 	return &message.SendMessageResponse{
 		MsgID:          msg.MsgID,
