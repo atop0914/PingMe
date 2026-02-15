@@ -175,14 +175,12 @@ type KafkaMessageConsumer struct {
 	msgRepo *msgrepo.Repository
 	hub     interface {
 		SendToUser(userID string, message []byte)
-		GetUserConnections(userID string) interface{}
 	}
 }
 
 // NewKafkaMessageConsumer 创建 Kafka 消息消费者
 func NewKafkaMessageConsumer(msgRepo *msgrepo.Repository, hub interface {
 	SendToUser(userID string, message []byte)
-	GetUserConnections(userID string) interface{}
 }) *KafkaMessageConsumer {
 	return &KafkaMessageConsumer{
 		msgRepo: msgRepo,

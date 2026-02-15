@@ -187,23 +187,12 @@ func main() {
 		c.JSON(404, response.FailWithMessage("not found", 404))
 	})
 
-	// 直接在主线程启动 HTTP 服务器
-	addr := fmt.Sprintf("%s:%d", cfg.App.Host, cfg.App.Port)
-	logger.Info("Server listening", "address", addr)
-	
-	srv := &http.Server{
-		Addr:    addr,
-		Handler: r,
-	}
+	// Create context for hub
+	ctx, cancel := context.WithCancel(context.Background())
 
 	// Handle shutdown signals
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		<-quit
-		logger.Info("Received shutdown signal")
-		srv.Close()
-	}()
 
 	// Start hub with context (后台运行)
 	go hub.Run(ctx)
@@ -213,14 +202,6 @@ func main() {
 		go hub.StartCleanupTask(ctx)
 	}
 
-	// Create context for graceful shutdown
-	ctx, cancel := context.WithCancel(context.Background())
-
-	// Start cleanup task for online status
-	if hub.RedisClient != nil {
-		go hub.StartCleanupTask(ctx)
-	}
-
 	// 直接在主线程启动 HTTP 服务器
 	addr := fmt.Sprintf("%s:%d", cfg.App.Host, cfg.App.Port)
 	logger.Info("Server listening", "address", addr)
@@ -229,7 +210,14 @@ func main() {
 		Addr:    addr,
 		Handler: r,
 	}
-	
+
+	// Handle shutdown in goroutine
+	go func() {
+		<-quit
+		logger.Info("Received shutdown signal")
+		srv.Close()
+	}()
+
 	// 阻塞直到服务器出错
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		logger.Error("Server failed to start", "error", err)
