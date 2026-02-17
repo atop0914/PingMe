@@ -96,6 +96,66 @@ var (
 		Code:       "20004",
 	}
 
+	// ==================== Kafka 消费错误码 (5xxxx) ====================
+
+	// KafkaError Kafka 基础错误
+	KafkaError = &Code{
+		HTTPStatus: http.StatusInternalServerError,
+		Message:    "kafka error",
+		Code:       "50001",
+	}
+
+	// KafkaMessageUnmarshalError 消息解析失败
+	KafkaMessageUnmarshalError = &Code{
+		HTTPStatus: http.StatusBadRequest,
+		Message:    "kafka message unmarshal failed",
+		Code:       "50002",
+	}
+
+	// KafkaMessagePersistError 消息持久化失败
+	KafkaMessagePersistError = &Code{
+		HTTPStatus: http.StatusInternalServerError,
+		Message:    "message persist failed",
+		Code:       "50003",
+	}
+
+	// KafkaMessageDeliveryError 消息投递失败
+	KafkaMessageDeliveryError = &Code{
+		HTTPStatus: http.StatusInternalServerError,
+		Message:    "message delivery failed",
+		Code:       "50004",
+	}
+
+	// KafkaConsumerGroupError 消费者组错误
+	KafkaConsumerGroupError = &Code{
+		HTTPStatus: http.StatusInternalServerError,
+		Message:    "kafka consumer group error",
+		Code:       "50005",
+	}
+
+	// KafkaRetryExhausted 重试次数耗尽
+	KafkaRetryExhausted = &Code{
+		HTTPStatus: http.StatusInternalServerError,
+		Message:    "kafka retry exhausted, message sent to DLQ",
+		Code:       "50006",
+	}
+
+	// KafkaDLQSendError 死信队列发送失败
+	KafkaDLQSendError = &Code{
+		HTTPStatus: http.StatusInternalServerError,
+		Message:    "failed to send message to DLQ",
+		Code:       "50007",
+	}
+
+	// KafkaProducerError Kafka 生产者错误
+	KafkaProducerError = &Code{
+		HTTPStatus: http.StatusInternalServerError,
+		Message:    "kafka producer error",
+		Code:       "50008",
+	}
+
+	// ==================== 业务错误码 (3xxxx) ====================
+
 	// UserNotFound 用户不存在
 	UserNotFound = &Code{
 		HTTPStatus: http.StatusNotFound,

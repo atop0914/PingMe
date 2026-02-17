@@ -59,9 +59,14 @@ func (r RedisConfig) Addr() string {
 }
 
 type KafkaConfig struct {
-	Brokers       []string `yaml:"brokers"`
-	ConsumerGroup string   `yaml:"consumer_group"`
-	TopicPrefix   string   `yaml:"topic_prefix"`
+	Brokers            []string `yaml:"brokers"`
+	ConsumerGroup      string   `yaml:"consumer_group"`
+	TopicPrefix        string   `yaml:"topic_prefix"`
+	RetryMaxAttempts   int      `yaml:"retry_max_attempts"`    // 最大重试次数
+	RetryInitialBackoff int     `yaml:"retry_initial_backoff"` // 初始退避时间 (毫秒)
+	RetryMaxBackoff    int      `yaml:"retry_max_backoff"`     // 最大退避时间 (毫秒)
+	RetryMultiplier    float64  `yaml:"retry_multiplier"`      // 退避倍数
+	EnableDLQ          bool     `yaml:"enable_dlq"`            // 是否启用 DLQ
 }
 
 type JWTConfig struct {

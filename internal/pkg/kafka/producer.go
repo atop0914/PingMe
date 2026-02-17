@@ -23,6 +23,16 @@ type MessageData struct {
 	Status         string `json:"status"`
 }
 
+// DeliveryEvent 投递事件
+type DeliveryEvent struct {
+	MsgID          string `json:"msg_id"`
+	ConversationID string `json:"conversation_id"`
+	FromUserID     string `json:"from_user_id"`
+	ToUserID       string `json:"to_user_id"`
+	Status         string `json:"status"` // delivered
+	DeliveredAt    int64  `json:"delivered_at"`
+}
+
 // Producer Kafka 生产者
 type Producer struct {
 	producer     sarama.SyncProducer

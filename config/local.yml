@@ -10,8 +10,8 @@ database:
   host: "localhost"
   port: 3306
   username: "root"
-  password: "root123"
-  name: "im"
+  password: "secret"
+  name: "pingme"
   max_open_conns: 25
   max_idle_conns: 5
   conn_max_lifetime: 300 # seconds
@@ -30,6 +30,11 @@ kafka:
     - "localhost:9092"
   consumer_group: "pingme-consumer"
   topic_prefix: "pingme"
+  retry_max_attempts: 3      # 最大重试次数
+  retry_initial_backoff: 100 # 初始退避时间 (毫秒)
+  retry_max_backoff: 10000  # 最大退避时间 (毫秒)
+  retry_multiplier: 2.0     # 退避倍数
+  enable_dlq: true          # 是否启用 DLQ
 
 # JWT Configuration
 jwt:

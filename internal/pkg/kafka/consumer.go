@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"PingMe/internal/errorcode"
 	"PingMe/internal/logger"
 	"PingMe/internal/model/message"
 	msgrepo "PingMe/internal/repository/message"
@@ -14,14 +15,13 @@ import (
 	"github.com/IBM/sarama"
 )
 
-// DeliveryEvent 投递事件
-type DeliveryEvent struct {
-	MsgID          string `json:"msg_id"`
-	ConversationID string `json:"conversation_id"`
-	FromUserID     string `json:"from_user_id"`
-	ToUserID       string `json:"to_user_id"`
-	Status         string `json:"status"` // delivered
-	DeliveredAt    int64  `json:"delivered_at"`
+// DLQMessage 死信队列消息结构
+type DLQMessage struct {
+	OriginalMsg   MessageData `json:"original_msg"`
+	Error         string       `json:"error"`
+	RetryCount    int          `json:"retry_count"`
+	FailedAt      int64        `json:"failed_at"`
+	ErrorCode     string       `json:"error_code"`
 }
 
 // ConsumerHandler 消费者处理接口
@@ -32,13 +32,46 @@ type ConsumerHandler interface {
 	HandleDeliveryEvent(event *DeliveryEvent) error
 }
 
+// RetryConfig 重试配置
+type RetryConfig struct {
+	MaxAttempts   int           // 最大重试次数
+	InitialDelay  time.Duration // 初始延迟
+	MaxDelay      time.Duration // 最大延迟
+	Multiplier    float64       // 延迟倍数
+}
+
+// DefaultRetryConfig 默认重试配置
+func DefaultRetryConfig() *RetryConfig {
+	return &RetryConfig{
+		MaxAttempts:  3,
+		InitialDelay: 100 * time.Millisecond,
+		MaxDelay:     10 * time.Second,
+		Multiplier:   2.0,
+	}
+}
+
+// CalculateDelay 计算重试延迟（指数退避）
+func (r *RetryConfig) CalculateDelay(retryCount int) time.Duration {
+	delay := r.InitialDelay
+	for i := 0; i < retryCount; i++ {
+		delay = time.Duration(float64(delay) * r.Multiplier)
+		if delay > r.MaxDelay {
+			delay = r.MaxDelay
+		}
+	}
+	return delay
+}
+
 // Consumer Kafka 消费者
 type Consumer struct {
 	consumer    sarama.ConsumerGroup
 	topic       string
+	dlqTopic    string
 	config      *Config
+	retryConfig *RetryConfig
 	handler     ConsumerHandler
 	msgRepo     *msgrepo.Repository
+	dlqProducer sarama.SyncProducer
 	wg          sync.WaitGroup
 	ctx         context.Context
 	cancel      context.CancelFunc
@@ -62,23 +95,50 @@ func NewConsumer(cfg *Config, handler ConsumerHandler, msgRepo *msgrepo.Reposito
 		return nil, fmt.Errorf("failed to create Kafka consumer: %w", err)
 	}
 
+	// 初始化 DLQ Producer
+	var dlqProducer sarama.SyncProducer
+	if cfg.EnableDLQ {
+		dlqConfig := sarama.NewConfig()
+		dlqConfig.Producer.RequiredAcks = sarama.WaitForAll
+		dlqConfig.Producer.Retry.Max = 3
+		dlqProducer, err = sarama.NewSyncProducer(cfg.Brokers, dlqConfig)
+		if err != nil {
+			logger.Warn("Failed to create DLQ producer, DLQ disabled", "error", err)
+			cfg.EnableDLQ = false
+		}
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 
+	// 构建重试配置
+	retryConfig := &RetryConfig{
+		MaxAttempts:  cfg.GetRetryMaxAttempts(),
+		InitialDelay: time.Duration(cfg.GetRetryInitialBackoff()) * time.Millisecond,
+		MaxDelay:     time.Duration(cfg.GetRetryMaxBackoff()) * time.Millisecond,
+		Multiplier:   cfg.GetRetryMultiplier(),
+	}
+
 	c := &Consumer{
-		consumer: consumer,
-		topic:    cfg.GetMessageTopic(),
-		config:   cfg,
-		handler:  handler,
-		msgRepo:  msgRepo,
-		ctx:      ctx,
-		cancel:   cancel,
-		ready:    make(chan bool),
+		consumer:    consumer,
+		topic:      cfg.GetMessageTopic(),
+		dlqTopic:   cfg.GetDLQTopic(),
+		config:     cfg,
+		retryConfig: retryConfig,
+		handler:    handler,
+		msgRepo:    msgRepo,
+		dlqProducer: dlqProducer,
+		ctx:        ctx,
+		cancel:     cancel,
+		ready:      make(chan bool),
 	}
 
 	logger.Info("Kafka consumer initialized",
 		"brokers", cfg.Brokers,
 		"topic", c.topic,
-		"consumer_group", cfg.ConsumerGroup)
+		"dlq_topic", c.dlqTopic,
+		"dlq_enabled", cfg.EnableDLQ,
+		"consumer_group", cfg.ConsumerGroup,
+		"retry_max_attempts", retryConfig.MaxAttempts)
 
 	return c, nil
 }
@@ -117,6 +177,10 @@ func (c *Consumer) Stop() {
 		c.consumer.Close()
 	}
 
+	if c.dlqProducer != nil {
+		c.dlqProducer.Close()
+	}
+
 	logger.Info("Kafka consumer stopped")
 }
 
@@ -145,29 +209,120 @@ func (c *Consumer) ConsumeClaim(session sarama.ConsumerGroupSession, claim saram
 			// 解析消息
 			var msgData MessageData
 			if err := json.Unmarshal(msg.Value, &msgData); err != nil {
-				logger.Warn("Failed to unmarshal message",
+				logger.Error("Failed to unmarshal message",
 					"error", err,
-					"offset", msg.Offset)
+					"offset", msg.Offset,
+					"error_code", errorcode.KafkaMessageUnmarshalError.Code)
+				// 解析失败，不 ACK，消息会被重复消费
+				// 这里我们可以选择发送 到 DLQ 或者直接跳过
+				c.sendToDLQ(&msgData, err.Error(), 0, errorcode.KafkaMessageUnmarshalError.Code)
 				session.MarkMessage(msg, "")
 				continue
 			}
 
-			// 处理消息（落库 + 生成投递事件）
-			if err := c.handler.HandleMessage(c.ctx, &msgData); err != nil {
-				logger.Error("Failed to handle message",
-					"msg_id", msgData.MsgID,
-					"error", err)
-				// 消息处理失败，不 ACK，触发重试
-				continue
-			}
+			// 处理消息（带重试）
+			retryCount := 0
+			maxRetries := c.retryConfig.MaxAttempts
 
-			// 标记消息已处理
-			session.MarkMessage(msg, "")
-			logger.Debug("Message consumed and processed",
-				"msg_id", msgData.MsgID,
-				"offset", msg.Offset)
+			for retryCount <= maxRetries {
+				err := c.handler.HandleMessage(c.ctx, &msgData)
+				
+				if err == nil {
+					// 处理成功，标记消息已处理
+					session.MarkMessage(msg, "")
+					logger.Info("Message consumed and processed",
+						"msg_id", msgData.MsgID,
+						"offset", msg.Offset,
+						"retry_count", retryCount)
+					break
+				}
+
+				retryCount++
+				
+				logger.Warn("Message processing failed, will retry",
+					"msg_id", msgData.MsgID,
+					"error", err,
+					"retry_count", retryCount,
+					"max_retries", maxRetries)
+
+				if retryCount <= maxRetries {
+					// 计算退避时间
+					delay := c.retryConfig.CalculateDelay(retryCount - 1)
+					logger.Info("Retrying after delay",
+						"msg_id", msgData.MsgID,
+						"delay", delay,
+						"retry_count", retryCount)
+					
+					select {
+					case <-c.ctx.Done():
+						return nil
+					case <-time.After(delay):
+						// 继续重试
+					}
+				} else {
+					// 重试次数耗尽
+					logger.Error("Message processing failed after all retries, sending to DLQ",
+						"msg_id", msgData.MsgID,
+						"error", err,
+						"error_code", errorcode.KafkaRetryExhausted.Code)
+
+					// 发送到 DLQ
+					c.sendToDLQ(&msgData, err.Error(), retryCount, errorcode.KafkaRetryExhausted.Code)
+					
+					// 标记消息已处理（避免无限重试）
+					session.MarkMessage(msg, "")
+				}
+			}
 		}
 	}
+}
+
+// sendToDLQ 发送消息到死信队列
+func (c *Consumer) sendToDLQ(msg *MessageData, errorMsg string, retryCount int, errorCode string) {
+	if !c.config.EnableDLQ || c.dlqProducer == nil {
+		logger.Debug("DLQ disabled, skipping",
+			"msg_id", msg.MsgID)
+		return
+	}
+
+	dlqMsg := DLQMessage{
+		OriginalMsg: *msg,
+		Error:       errorMsg,
+		RetryCount:  retryCount,
+		FailedAt:    time.Now().UnixMilli(),
+		ErrorCode:   errorCode,
+	}
+
+	value, err := json.Marshal(dlqMsg)
+	if err != nil {
+		logger.Error("Failed to marshal DLQ message",
+			"msg_id", msg.MsgID,
+			"error", err)
+		return
+	}
+
+	kafkaMsg := &sarama.ProducerMessage{
+		Topic: c.dlqTopic,
+		Key:   sarama.StringEncoder(msg.MsgID),
+		Value: sarama.ByteEncoder(value),
+	}
+
+	partition, offset, err := c.dlqProducer.SendMessage(kafkaMsg)
+	if err != nil {
+		logger.Error("Failed to send message to DLQ",
+			"msg_id", msg.MsgID,
+			"error", err,
+			"error_code", errorcode.KafkaDLQSendError.Code)
+		return
+	}
+
+	logger.Info("Message sent to DLQ",
+		"msg_id", msg.MsgID,
+		"partition", partition,
+		"offset", offset,
+		"dlq_topic", c.dlqTopic,
+		"retry_count", retryCount,
+		"error_code", errorCode)
 }
 
 // KafkaMessageConsumer 实现 ConsumerHandler 接口
@@ -175,14 +330,12 @@ type KafkaMessageConsumer struct {
 	msgRepo *msgrepo.Repository
 	hub     interface {
 		SendToUser(userID string, message []byte)
-		GetUserConnections(userID string) interface{}
 	}
 }
 
 // NewKafkaMessageConsumer 创建 Kafka 消息消费者
 func NewKafkaMessageConsumer(msgRepo *msgrepo.Repository, hub interface {
 	SendToUser(userID string, message []byte)
-	GetUserConnections(userID string) interface{}
 }) *KafkaMessageConsumer {
 	return &KafkaMessageConsumer{
 		msgRepo: msgRepo,
@@ -191,6 +344,7 @@ func NewKafkaMessageConsumer(msgRepo *msgrepo.Repository, hub interface {
 }
 
 // HandleMessage 处理消息：落库 + 投递
+// 消息投递语义: at-least-once + 幂等
 func (h *KafkaMessageConsumer) HandleMessage(ctx context.Context, msg *MessageData) error {
 	// 幂等检查：检查 msg_id 是否已存在
 	existingMsg, err := h.msgRepo.GetMessageByMsgID(msg.MsgID)
@@ -218,8 +372,9 @@ func (h *KafkaMessageConsumer) HandleMessage(ctx context.Context, msg *MessageDa
 	if err := h.msgRepo.CreateMessage(msgModel); err != nil {
 		logger.Error("Failed to save message to DB",
 			"msg_id", msg.MsgID,
-			"error", err)
-		return fmt.Errorf("failed to create message: %w", err)
+			"error", err,
+			"error_code", errorcode.KafkaMessagePersistError.Code)
+		return fmt.Errorf("failed to create message: %w (code: %s)", err, errorcode.KafkaMessagePersistError.Code)
 	}
 
 	// 尝试实时投递
@@ -236,12 +391,14 @@ func (h *KafkaMessageConsumer) HandleMessage(ctx context.Context, msg *MessageDa
 
 	logger.Info("Message processed",
 		"msg_id", msg.MsgID,
-		"delivered", delivered)
+		"delivered", delivered,
+		"delivery_semantic", "at-least-once")
 
 	return nil
 }
 
 // deliverMessage 尝试实时投递消息
+// 返回 true 表示投递成功，false 表示用户离线
 func (h *KafkaMessageConsumer) deliverMessage(ctx context.Context, toUserID string, msg *MessageData) bool {
 	// 构建推送消息
 	pushMsg := map[string]interface{}{

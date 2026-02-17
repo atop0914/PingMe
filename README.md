@@ -10,6 +10,34 @@ A Go-based instant messaging system supporting private chats, group chats, offli
 - **Offline Message Handling**: Message storage and retrieval
 - **Online Status**: Redis-based presence management
 - **Kafka Integration**: Asynchronous message processing
+- **Message Retry**: Exponential backoff retry mechanism
+- **DLQ Support**: Dead Letter Queue for failed messages
+
+## Message Delivery Semantics
+
+### At-Least-Once Delivery
+The system guarantees at-least-once delivery for messages processed through Kafka. Each message is persisted to the database before acknowledgment, ensuring no message loss.
+
+### Idempotency
+Messages are idempotent through `msg_id` deduplication. If a message is processed multiple times (due to retry or re-consumption), it's only stored once in the database.
+
+### Retry Strategy
+When message processing fails:
+1. **Retry Attempts**: Up to 3 retries (configurable)
+2. **Backoff**: Exponential backoff starting at 100ms, doubling each retry, capped at 10s
+3. **DLQ**: After all retries exhausted, message is sent to Dead Letter Queue
+
+### Error Codes (Kafka - 5xxxx)
+| Code | Description |
+|------|-------------|
+| 50001 | Kafka base error |
+| 50002 | Message unmarshal failed |
+| 50003 | Message persist failed |
+| 50004 | Message delivery failed |
+| 50005 | Consumer group error |
+| 50006 | Retry exhausted, sent to DLQ |
+| 50007 | DLQ send failed |
+| 50008 | Producer error |
 
 ## Quick Start
 
@@ -83,6 +111,13 @@ redis:
 kafka:
   brokers:
     - "localhost:9092"
+  consumer_group: "pingme-consumer"
+  topic_prefix: "pingme"
+  retry_max_attempts: 3      # Max retry attempts
+  retry_initial_backoff: 100 # Initial backoff (ms)
+  retry_max_backoff: 10000  # Max backoff (ms)
+  retry_multiplier: 2.0     # Backoff multiplier
+  enable_dlq: true          # Enable Dead Letter Queue
 ```
 
 ### Build & Run

@@ -143,3 +143,43 @@ type CreateConversationRequest struct {
 	Name      string           `json:"name"`       // 群名称
 	MemberIDs []string         `json:"member_ids"` // 群成员
 }
+
+// UserCursor 用户游标（用于离线消息拉取和已读位置跟踪）
+type UserCursor struct {
+	ID             uint      `json:"id" gorm:"primaryKey"`
+	UserID         string    `json:"user_id" gorm:"type:varchar(36);index:idx_user_conv,1;not null"`
+	ConversationID string    `json:"conversation_id" gorm:"type:varchar(128);index:idx_user_conv,2;not null"`
+	LastReadMsgID  string    `json:"last_read_msg_id" gorm:"type:varchar(64)"` // 最后已读消息ID
+	LastReadTS     int64     `json:"last_read_ts" gorm:"index"`                 // 最后已读消息时间戳
+	UnreadCount    int       `json:"unread_count" gorm:"default:0"`             // 未读数（缓存）
+	UpdatedAt      time.Time `json:"updated_at"`
+	CreatedAt      time.Time `json:"created_at"`
+}
+
+// PullOfflineMessagesRequest 拉取离线消息请求
+type PullOfflineMessagesRequest struct {
+	Cursor      string `form:"cursor"`       // 游标（base64编码的server_ts:id）
+	Limit       int    `form:"limit,default=50"`
+	ConversationID string `form:"conversation_id"` // 可选：指定会话，不指定则拉取所有
+}
+
+// PullOfflineMessagesResponse 拉取离线消息响应
+type PullOfflineMessagesResponse struct {
+	Messages          []Message `json:"messages"`
+	HasMore           bool      `json:"has_more"`
+	NextCursor        string    `json:"next_cursor,omitempty"`
+	Conversations     []ConversationUnreadCount `json:"conversations"`
+}
+
+// ConversationUnreadCount 会话未读数
+type ConversationUnreadCount struct {
+	ConversationID string `json:"conversation_id"`
+	UnreadCount    int    `json:"unread_count"`
+	LastMessage    *Message `json:"last_message,omitempty"`
+}
+
+// MarkReadRequest 标记已读请求
+type MarkReadRequest struct {
+	ConversationID string `json:"conversation_id" binding:"required"`
+	MsgID          string `json:"msg_id" binding:"required"`
+}

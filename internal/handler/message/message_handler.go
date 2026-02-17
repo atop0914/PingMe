@@ -242,3 +242,80 @@ func (h *MessageHandler) PullOfflineMessages(c *gin.Context) {
 
 	response.SuccessGin(c, messages)
 }
+
+// PullOfflineMessagesV2 拉取离线消息（改进版）
+// @Summary 使用游标拉取离线消息
+// @Tags messages
+// @Accept json
+// @Produce json
+// @Security BearerAuth
+// @Param cursor query string false "游标（base64编码的server_ts:id）"
+// @Param limit query int false "返回数量，默认50"
+// @Param conversation_id query string false "会话ID，不指定则拉取所有"
+// @Success 200 {object} response.Response{data=message.PullOfflineMessagesResponse}
+// @Router /api/v1/messages/offline [get]
+func (h *MessageHandler) PullOfflineMessagesV2(c *gin.Context) {
+	claims := middleware.GetUserClaims(c)
+	if claims == nil {
+		response.Error(c, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+	userID := claims.UserID
+
+	cursor := c.Query("cursor")
+	conversationID := c.Query("conversation_id")
+
+	limitStr := c.DefaultQuery("limit", "50")
+	limit, err := strconv.Atoi(limitStr)
+	if err != nil || limit <= 0 || limit > 100 {
+		limit = 50
+	}
+
+	resp, err := h.msgService.PullOfflineMessagesV2(c.Request.Context(), userID, cursor, limit, conversationID)
+	if err != nil {
+		logger.Error("Failed to pull offline messages",
+			"user_id", userID,
+			"cursor", cursor,
+			"error", err)
+		response.Error(c, http.StatusInternalServerError, "Failed to pull offline messages: "+err.Error())
+		return
+	}
+
+	response.SuccessGin(c, resp)
+}
+
+// MarkAsRead 标记消息已读
+// @Summary 标记会话消息已读
+// @Tags messages
+// @Accept json
+// @Produce json
+// @Security BearerAuth
+// @Param request body message.MarkReadRequest true "已读请求"
+// @Success 200 {object} response.Response
+// @Router /api/v1/messages/read [post]
+func (h *MessageHandler) MarkAsRead(c *gin.Context) {
+	claims := middleware.GetUserClaims(c)
+	if claims == nil {
+		response.Error(c, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+	userID := claims.UserID
+
+	var req message.MarkReadRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.Error(c, http.StatusBadRequest, "Invalid request: "+err.Error())
+		return
+	}
+
+	if err := h.msgService.MarkAsRead(c.Request.Context(), userID, &req); err != nil {
+		logger.Error("Failed to mark as read",
+			"user_id", userID,
+			"conversation_id", req.ConversationID,
+			"msg_id", req.MsgID,
+			"error", err)
+		response.Error(c, http.StatusInternalServerError, "Failed to mark as read: "+err.Error())
+		return
+	}
+
+	response.SuccessGin(c, gin.H{"message": "ok"})
+}

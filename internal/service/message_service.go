@@ -14,6 +14,7 @@ import (
 	"PingMe/internal/repository/user"
 
 	"github.com/google/uuid"
+	"gorm.io/gorm"
 )
 
 // MessageService 消息服务
@@ -298,4 +299,148 @@ func (s *MessageService) GetConversation(conversationID string) (*message.Conver
 // IsMember 检查用户是否为会话成员
 func (s *MessageService) IsMember(conversationID, userID string) (bool, error) {
 	return s.msgRepo.IsConversationMember(conversationID, userID)
+}
+
+// PullOfflineMessagesV2 使用游标拉取离线消息（改进版）
+func (s *MessageService) PullOfflineMessagesV2(ctx context.Context, userID string, cursorStr string, limit int, conversationID string) (*message.PullOfflineMessagesResponse, error) {
+	// 解码游标
+	cursorTS, cursorID, err := message.DecodeCursor(cursorStr)
+	if err != nil {
+		logger.Warn("Invalid cursor format, using default",
+			"cursor", cursorStr,
+			"error", err)
+		cursorTS, cursorID = 0, 0
+	}
+
+	// 如果指定了会话，只拉取该会话的消息
+	if conversationID != "" {
+		messages, err := s.msgRepo.GetMessagesByCursor(conversationID, cursorTS, cursorID, limit, true)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get messages: %w", err)
+		}
+
+		// 构建响应
+		hasMore := len(messages) > limit
+		if hasMore {
+			messages = messages[:limit]
+		}
+
+		var nextCursor string
+		if len(messages) > 0 && hasMore {
+			lastMsg := messages[len(messages)-1]
+			nextCursor = message.EncodeCursor(lastMsg.ServerTS, lastMsg.ID)
+		}
+
+		return &message.PullOfflineMessagesResponse{
+			Messages:   messages,
+			HasMore:    hasMore,
+			NextCursor: nextCursor,
+		}, nil
+	}
+
+	// 拉取所有会话的离线消息
+	messages, err := s.msgRepo.GetMessagesWithCursor(userID, cursorTS, cursorID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get offline messages: %w", err)
+	}
+
+	hasMore := len(messages) > limit
+	if hasMore {
+		messages = messages[:limit]
+	}
+
+	var nextCursor string
+	if len(messages) > 0 && hasMore {
+		lastMsg := messages[len(messages)-1]
+		nextCursor = message.EncodeCursor(lastMsg.ServerTS, lastMsg.ID)
+	}
+
+	// 获取各会话未读数
+	unreadCounts, err := s.msgRepo.GetConversationUnreadCounts(userID)
+	if err != nil {
+		logger.Warn("Failed to get unread counts",
+			"error", err)
+	}
+
+	// 构建会话未读信息
+	convUnreadList := make([]message.ConversationUnreadCount, 0)
+	convSet := make(map[string]bool)
+	for _, msg := range messages {
+		if !convSet[msg.ConversationID] {
+			convSet[msg.ConversationID] = true
+			lastMsg, _ := s.msgRepo.GetLastMessage(msg.ConversationID)
+			convUnreadList = append(convUnreadList, message.ConversationUnreadCount{
+				ConversationID: msg.ConversationID,
+				UnreadCount:    int(unreadCounts[msg.ConversationID]),
+				LastMessage:    lastMsg,
+			})
+		}
+	}
+
+	return &message.PullOfflineMessagesResponse{
+		Messages:      messages,
+		HasMore:       hasMore,
+		NextCursor:    nextCursor,
+		Conversations: convUnreadList,
+	}, nil
+}
+
+// MarkAsRead 标记消息已读
+func (s *MessageService) MarkAsRead(ctx context.Context, userID string, req *message.MarkReadRequest) error {
+	// 验证用户是否为会话成员
+	isMember, err := s.msgRepo.IsConversationMember(req.ConversationID, userID)
+	if err != nil {
+		return fmt.Errorf("failed to check membership: %w", err)
+	}
+	if !isMember {
+		return fmt.Errorf("not a member of this conversation")
+	}
+
+	// 获取消息信息
+	msg, err := s.msgRepo.GetMessageByMsgID(req.MsgID)
+	if err != nil {
+		return fmt.Errorf("message not found: %w", err)
+	}
+
+	// 更新或创建用户游标
+	cursor := &message.UserCursor{
+		UserID:         userID,
+		ConversationID: req.ConversationID,
+		LastReadMsgID:  req.MsgID,
+		LastReadTS:     msg.ServerTS,
+		UpdatedAt:      time.Now(),
+	}
+
+	if err := s.msgRepo.UpsertUserCursor(cursor); err != nil {
+		return fmt.Errorf("failed to update cursor: %w", err)
+	}
+
+	// 更新消息状态为已读
+	if err := s.msgRepo.UpdateMessageStatus(req.MsgID, message.MsgStatusRead); err != nil {
+		logger.Warn("Failed to update message status",
+			"msg_id", req.MsgID,
+			"error", err)
+	}
+
+	logger.Info("Marked messages as read",
+		"user_id", userID,
+		"conversation_id", req.ConversationID,
+		"msg_id", req.MsgID,
+		"server_ts", msg.ServerTS)
+
+	return nil
+}
+
+// GetUnreadCount 获取指定会话的未读数
+func (s *MessageService) GetUnreadCount(userID, conversationID string) (int64, error) {
+	cursor, err := s.msgRepo.GetUserCursor(userID, conversationID)
+	if err != nil {
+		if err == gorm.ErrRecordNotFound {
+			// 没有游标，说明从未已读该会话，返回所有消息数
+			return s.msgRepo.CountUnread(conversationID, userID)
+		}
+		return 0, err
+	}
+
+	return s.msgRepo.GetUnreadCountByCursor(userID, conversationID, cursor.LastReadTS)
 }

@@ -25,6 +25,7 @@ func (r *Repository) InitSchema() error {
 		&msgmodel.Message{},
 		&msgmodel.Conversation{},
 		&msgmodel.ConversationMember{},
+		&msgmodel.UserCursor{},
 	)
 }
 
@@ -232,6 +233,142 @@ func (r *Repository) CountUnread(conversationID, userID string) (int64, error) {
 			conversationID, userID, msgmodel.MsgStatusRead).
 		Count(&count).Error
 	return count, err
+}
+
+// GetUserCursor 获取用户会话游标
+func (r *Repository) GetUserCursor(userID, conversationID string) (*msgmodel.UserCursor, error) {
+	var cursor msgmodel.UserCursor
+	err := r.db.Where("user_id = ? AND conversation_id = ?", userID, conversationID).First(&cursor).Error
+	if err != nil {
+		return nil, err
+	}
+	return &cursor, nil
+}
+
+// UpsertUserCursor 更新或创建用户会话游标
+func (r *Repository) UpsertUserCursor(cursor *msgmodel.UserCursor) error {
+	return r.db.Where("user_id = ? AND conversation_id = ?", cursor.UserID, cursor.ConversationID).
+		Assign(*cursor).
+		FirstOrCreate(cursor).Error
+}
+
+// GetUserCursors 获取用户所有会话游标
+func (r *Repository) GetUserCursors(userID string) ([]msgmodel.UserCursor, error) {
+	var cursors []msgmodel.UserCursor
+	err := r.db.Where("user_id = ?", userID).Find(&cursors).Error
+	return cursors, err
+}
+
+// GetUnreadCountByCursor 根据游标计算未读数
+func (r *Repository) GetUnreadCountByCursor(userID, conversationID string, lastReadTS int64) (int64, error) {
+	var count int64
+	err := r.db.Model(&msgmodel.Message{}).
+		Where("conversation_id = ? AND from_user_id != ? AND server_ts > ?", 
+			conversationID, userID, lastReadTS).
+		Count(&count).Error
+	return count, err
+}
+
+// GetMessagesByCursor 游标分页获取消息（更稳定的分页）
+func (r *Repository) GetMessagesByCursor(conversationID string, cursorTS int64, cursorID uint, limit int, isAfter bool) ([]msgmodel.Message, error) {
+	query := r.db.Where("conversation_id = ?", conversationID)
+
+	if isAfter {
+		// 向后翻页（拉取更新的消息）
+		if cursorTS > 0 {
+			query = query.Where("server_ts > ? OR (server_ts = ? AND id > ?)", cursorTS, cursorTS, cursorID)
+		}
+		query = query.Order("server_ts ASC, id ASC")
+	} else {
+		// 向前翻页（拉取历史消息）
+		if cursorTS > 0 {
+			query = query.Where("server_ts < ? OR (server_ts = ? AND id < ?)", cursorTS, cursorTS, cursorID)
+		} else {
+			// 首次拉取，从最新开始
+			query = query.Order("server_ts DESC, id DESC")
+		}
+		if cursorTS == 0 {
+			// 首次拉取才需要倒序
+			limit = limit + 1
+		}
+	}
+
+	var messages []msgmodel.Message
+	err := query.Limit(limit).Find(&messages).Error
+	return messages, err
+}
+
+// GetMessagesWithCursor 使用游标拉取离线消息（支持所有会话）
+func (r *Repository) GetMessagesWithCursor(userID string, cursorTS int64, cursorID uint, limit int) ([]msgmodel.Message, error) {
+	// 获取用户所有会话
+	var members []msgmodel.ConversationMember
+	err := r.db.Where("user_id = ?", userID).Find(&members).Error
+	if err != nil {
+		return nil, err
+	}
+
+	if len(members) == 0 {
+		return []msgmodel.Message{}, nil
+	}
+
+	convIDs := make([]string, len(members))
+	for i, m := range members {
+		convIDs[i] = m.ConversationID
+	}
+
+	// 构建查询：获取指定时间之后的所有消息
+	var messages []msgmodel.Message
+	query := r.db.Where("conversation_id IN ? AND server_ts > ?", convIDs, cursorTS).
+		Or("conversation_id IN ? AND server_ts = ? AND id > ?", convIDs, cursorTS, cursorID).
+		Order("server_ts ASC, id ASC").
+		Limit(limit)
+
+	err = query.Find(&messages).Error
+	return messages, err
+}
+
+// GetConversationUnreadCounts 获取所有会话的未读数
+func (r *Repository) GetConversationUnreadCounts(userID string) (map[string]int64, error) {
+	// 获取用户所有会话
+	var members []msgmodel.ConversationMember
+	err := r.db.Where("user_id = ?", userID).Find(&members).Error
+	if err != nil {
+		return nil, err
+	}
+
+	if len(members) == 0 {
+		return make(map[string]int64), nil
+	}
+
+	convIDs := make([]string, len(members))
+	convMap := make(map[string]string) // convID -> userID (for checking)
+	for i, m := range members {
+		convIDs[i] = m.ConversationID
+		convMap[m.ConversationID] = m.UserID
+	}
+
+	// 获取用户的游标
+	cursors, err := r.GetUserCursors(userID)
+	cursorMap := make(map[string]int64)
+	for _, c := range cursors {
+		cursorMap[c.ConversationID] = c.LastReadTS
+	}
+
+	// 统计每个会话的未读数
+	result := make(map[string]int64)
+	for _, convID := range convIDs {
+		lastReadTS := cursorMap[convID]
+		var count int64
+		err := r.db.Model(&msgmodel.Message{}).
+			Where("conversation_id = ? AND from_user_id != ? AND server_ts > ?", 
+				convID, userID, lastReadTS).
+			Count(&count).Error
+		if err == nil {
+			result[convID] = count
+		}
+	}
+
+	return result, nil
 }
 
 // generatePrivateConversationID 生成私聊会话 ID
