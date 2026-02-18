@@ -183,3 +183,55 @@ type MarkReadRequest struct {
 	ConversationID string `json:"conversation_id" binding:"required"`
 	MsgID          string `json:"msg_id" binding:"required"`
 }
+
+// ========== ACK 机制相关类型 ==========
+
+// ACKType ACK 类型
+type ACKType string
+
+const (
+	ACKTypeDelivered ACKType = "delivered"
+	ACKTypeRead      ACKType = "read"
+)
+
+// MessageACK 消息回执
+type MessageACK struct {
+	ID             uint      `json:"id" gorm:"primaryKey"`
+	MsgID          string    `json:"msg_id" gorm:"type:varchar(64);index:idx_msg_user,1;not null"`
+	UserID         string    `json:"user_id" gorm:"type:varchar(36);index:idx_msg_user,2;not null"`
+	ConversationID string    `json:"conversation_id" gorm:"type:varchar(128);index;not null"`
+	ACKType        ACKType   `json:"ack_type" gorm:"type:varchar(20);not null"`
+	ACKTS          int64     `json:"ack_ts" gorm:"index"` // ACK 时间戳
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
+}
+
+// ACKSyncRequest 同步 ACK 状态请求（用于补偿）
+type ACKSyncRequest struct {
+	ConversationID string   `json:"conversation_id" binding:"required"`
+	LastACKMsgID   string   `json:"last_ack_msg_id"` // 客户端已确认的最后消息 ID
+	LastACKTS      int64    `json:"last_ack_ts"`    // 客户端 ACK 的最大时间戳
+	ACKTypes       []ACKType `json:"ack_types"`     // 需要同步的 ACK 类型
+}
+
+// ACKSyncResponse 同步 ACK 状态响应
+type ACKSyncResponse struct {
+	DeliveredACKs []MessageACK `json:"delivered_acks"` // 服务端有但客户端没有的 delivered ACK
+	ReadACKs      []MessageACK `json:"read_acks"`      // 服务端有但客户端没有的 read ACK
+	MissedCount   int          `json:"missed_count"`   // 缺失的 ACK 数量
+}
+
+// ClientACK 客户端发送的 ACK（通过 WebSocket）
+type ClientACK struct {
+	MsgID          string  `json:"msg_id" binding:"required"`
+	ConversationID string  `json:"conversation_id" binding:"required"`
+	ACKType        ACKType `json:"ack_type" binding:"required"`
+}
+
+// ClientACKResponse 客户端 ACK 响应
+type ClientACKResponse struct {
+	MsgID     string `json:"msg_id"`
+	ACKType   ACKType `json:"ack_type"`
+	ServerTS  int64  `json:"server_ts"`
+	Duplicate bool   `json:"duplicate"` // 是否是重复 ACK
+}

@@ -173,6 +173,10 @@ func main() {
 			messageRoutes.GET("/offline", messageHandler.PullOfflineMessages)  // 拉取离线消息（兼容旧版）
 			messageRoutes.GET("/offline/v2", messageHandler.PullOfflineMessagesV2) // 拉取离线消息（改进版）
 			messageRoutes.POST("/read", messageHandler.MarkAsRead)              // 标记已读
+			messageRoutes.POST("/ack", messageHandler.ProcessACK)                // 处理 ACK（送达/已读回执）
+			messageRoutes.POST("/ack/sync", messageHandler.SyncACKs)           // 同步 ACK（ACK 丢失补偿）
+			messageRoutes.GET("/ack/stats", messageHandler.GetACKStats)        // 获取 ACK 统计
+			messageRoutes.POST("/ack/cleanup", messageHandler.CleanupACKs)      // 清理过期 ACK
 		}
 
 		// Conversation routes (auth required)

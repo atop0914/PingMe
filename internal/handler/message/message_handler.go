@@ -319,3 +319,119 @@ func (h *MessageHandler) MarkAsRead(c *gin.Context) {
 
 	response.SuccessGin(c, gin.H{"message": "ok"})
 }
+
+// ProcessACK 处理客户端 ACK（HTTP 方式）
+// @Summary 处理消息回执
+// @Tags messages
+// @Accept json
+// @Produce json
+// @Security BearerAuth
+// @Param ack body message.ClientACK true "ACK 内容"
+// @Success 200 {object} response.Response{data=message.ClientACKResponse}
+// @Router /api/v1/messages/ack [post]
+func (h *MessageHandler) ProcessACK(c *gin.Context) {
+	claims := middleware.GetUserClaims(c)
+	if claims == nil {
+		response.Error(c, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+	userID := claims.UserID
+
+	var req message.ClientACK
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.Error(c, http.StatusBadRequest, "Invalid request: "+err.Error())
+		return
+	}
+
+	resp, err := h.msgService.ProcessACK(c.Request.Context(), userID, &req)
+	if err != nil {
+		logger.Error("Failed to process ACK",
+			"user_id", userID,
+			"msg_id", req.MsgID,
+			"error", err)
+		response.Error(c, http.StatusInternalServerError, "Failed to process ACK: "+err.Error())
+		return
+	}
+
+	response.SuccessGin(c, resp)
+}
+
+// SyncACKs 同步 ACK 状态（ACK 丢失补偿）
+// @Summary 同步消息回执状态
+// @Tags messages
+// @Accept json
+// @Produce json
+// @Security BearerAuth
+// @Param request body message.ACKSyncRequest true "同步请求"
+// @Success 200 {object} response.Response{data=message.ACKSyncResponse}
+// @Router /api/v1/messages/ack/sync [post]
+func (h *MessageHandler) SyncACKs(c *gin.Context) {
+	claims := middleware.GetUserClaims(c)
+	if claims == nil {
+		response.Error(c, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+	userID := claims.UserID
+
+	var req message.ACKSyncRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.Error(c, http.StatusBadRequest, "Invalid request: "+err.Error())
+		return
+	}
+
+	resp, err := h.msgService.SyncACKs(c.Request.Context(), userID, &req)
+	if err != nil {
+		logger.Error("Failed to sync ACKs",
+			"user_id", userID,
+			"conversation_id", req.ConversationID,
+			"error", err)
+		response.Error(c, http.StatusInternalServerError, "Failed to sync ACKs: "+err.Error())
+		return
+	}
+
+	response.SuccessGin(c, resp)
+}
+
+// GetACKStats 获取 ACK 统计信息
+// @Summary 获取回执统计
+// @Tags messages
+// @Produce json
+// @Security BearerAuth
+// @Success 200 {object} response.Response{data=map[string]int64}
+// @Router /api/v1/messages/ack/stats [get]
+func (h *MessageHandler) GetACKStats(c *gin.Context) {
+	stats, err := h.msgService.GetACKStats()
+	if err != nil {
+		logger.Error("Failed to get ACK stats", "error", err)
+		response.Error(c, http.StatusInternalServerError, "Failed to get ACK stats: "+err.Error())
+		return
+	}
+
+	response.SuccessGin(c, stats)
+}
+
+// CleanupACKs 清理过期的 ACK
+// @Summary 清理过期回执
+// @Tags messages
+// @Produce json
+// @Security BearerAuth
+// @Param days query int false "保留天数，默认7天"
+// @Success 200 {object} response.Response
+// @Router /api/v1/messages/ack/cleanup [post]
+func (h *MessageHandler) CleanupACKs(c *gin.Context) {
+	daysStr := c.DefaultQuery("days", "7")
+	days, err := strconv.Atoi(daysStr)
+	if err != nil {
+		response.Error(c, http.StatusBadRequest, "Invalid days parameter")
+		return
+	}
+
+	deletedCount, err := h.msgService.CleanupOldACKs(days)
+	if err != nil {
+		logger.Error("Failed to cleanup ACKs", "error", err)
+		response.Error(c, http.StatusInternalServerError, "Failed to cleanup ACKs: "+err.Error())
+		return
+	}
+
+	response.SuccessGin(c, gin.H{"deleted_count": deletedCount})
+}

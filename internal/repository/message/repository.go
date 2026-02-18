@@ -26,6 +26,7 @@ func (r *Repository) InitSchema() error {
 		&msgmodel.Conversation{},
 		&msgmodel.ConversationMember{},
 		&msgmodel.UserCursor{},
+		&msgmodel.MessageACK{},
 	)
 }
 
@@ -369,6 +370,105 @@ func (r *Repository) GetConversationUnreadCounts(userID string) (map[string]int6
 	}
 
 	return result, nil
+}
+
+// ========== ACK 相关方法 ==========
+
+// CreateOrUpdateACK 创建或更新 ACK（幂等操作）
+func (r *Repository) CreateOrUpdateACK(ack *msgmodel.MessageACK) error {
+	// 先查询是否已存在
+	var existing msgmodel.MessageACK
+	err := r.db.Where("msg_id = ? AND user_id = ? AND ack_type = ?", 
+		ack.MsgID, ack.UserID, ack.ACKType).First(&existing).Error
+	
+	if err == nil {
+		// 已存在，更新时间戳（幂等：重复 ACK 不改变最终状态）
+		if ack.ACKTS > existing.ACKTS {
+			return r.db.Model(&existing).Update("ack_ts", ack.ACKTS).Error
+		}
+		return nil // 重复 ACK，直接返回
+	}
+	
+	if err != gorm.ErrRecordNotFound {
+		return err
+	}
+	
+	// 不存在，创建新的
+	return r.db.Create(ack).Error
+}
+
+// GetACKByMsgIDAndUser 获取指定消息和用户的 ACK
+func (r *Repository) GetACKByMsgIDAndUser(msgID, userID string, ackType msgmodel.ACKType) (*msgmodel.MessageACK, error) {
+	var ack msgmodel.MessageACK
+	err := r.db.Where("msg_id = ? AND user_id = ? AND ack_type = ?", msgID, userID, ackType).First(&ack).Error
+	if err != nil {
+		return nil, err
+	}
+	return &ack, nil
+}
+
+// GetACKsByConversation 获取会话的所有 ACK（用于补偿）
+func (r *Repository) GetACKsByConversation(userID, conversationID string, afterTS int64, ackType msgmodel.ACKType) ([]msgmodel.MessageACK, error) {
+	var acks []msgmodel.MessageACK
+	query := r.db.Where("user_id = ? AND conversation_id = ? AND ack_type = ?", 
+		userID, conversationID, ackType)
+	
+	if afterTS > 0 {
+		query = query.Where("ack_ts > ?", afterTS)
+	}
+	
+	err := query.Order("ack_ts ASC").Find(&acks).Error
+	return acks, err
+}
+
+// GetLastACK 获取用户对会话的最后 ACK
+func (r *Repository) GetLastACK(userID, conversationID string, ackType msgmodel.ACKType) (*msgmodel.MessageACK, error) {
+	var ack msgmodel.MessageACK
+	err := r.db.Where("user_id = ? AND conversation_id = ? AND ack_type = ?", 
+		userID, conversationID, ackType).
+		Order("ack_ts DESC").
+		First(&ack).Error
+	if err != nil {
+		return nil, err
+	}
+	return &ack, nil
+}
+
+// DeleteOldACKs 清理过期的 ACK（回执表膨胀处理）
+// 保留策略：只保留最近 7 天的已读 ACK，30 天的送达 ACK
+func (r *Repository) DeleteOldACKs(retentionDays int) (int64, error) {
+	cutoffTime := time.Now().AddDate(0, 0, -retentionDays)
+	
+	// 删除已读 ACK（7天）
+	result := r.db.Where("ack_type = ? AND created_at < ?", msgmodel.ACKTypeRead, cutoffTime).Delete(&msgmodel.MessageACK{})
+	if result.Error != nil {
+		return 0, result.Error
+	}
+	
+	readCount := result.RowsAffected
+	
+	// 删除送达 ACK（30天）
+	cutoffTime = time.Now().AddDate(0, 0, -30)
+	result = r.db.Where("ack_type = ? AND created_at < ?", msgmodel.ACKTypeDelivered, cutoffTime).Delete(&msgmodel.MessageACK{})
+	if result.Error != nil {
+		return readCount, result.Error
+	}
+	
+	return readCount + result.RowsAffected, nil
+}
+
+// GetACKCount 获取 ACK 数量（用于监控）
+func (r *Repository) GetACKCount() (int64, error) {
+	var count int64
+	err := r.db.Model(&msgmodel.MessageACK{}).Count(&count).Error
+	return count, err
+}
+
+// GetACKCountByType 按类型统计 ACK 数量
+func (r *Repository) GetACKCountByType(ackType msgmodel.ACKType) (int64, error) {
+	var count int64
+	err := r.db.Model(&msgmodel.MessageACK{}).Where("ack_type = ?", ackType).Count(&count).Error
+	return count, err
 }
 
 // generatePrivateConversationID 生成私聊会话 ID

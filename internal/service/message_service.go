@@ -444,3 +444,274 @@ func (s *MessageService) GetUnreadCount(userID, conversationID string) (int64, e
 
 	return s.msgRepo.GetUnreadCountByCursor(userID, conversationID, cursor.LastReadTS)
 }
+
+// ========== ACK 机制相关方法 ==========
+
+// ProcessACK 处理客户端 ACK（幂等）
+func (s *MessageService) ProcessACK(ctx context.Context, userID string, ack *message.ClientACK) (*message.ClientACKResponse, error) {
+	// 1. 验证消息是否存在
+	msg, err := s.msgRepo.GetMessageByMsgID(ack.MsgID)
+	if err != nil {
+		return nil, fmt.Errorf("message not found: %w", err)
+	}
+
+	// 2. 验证用户是否为会话成员
+	isMember, err := s.msgRepo.IsConversationMember(ack.ConversationID, userID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to check membership: %w", err)
+	}
+	if !isMember {
+		return nil, fmt.Errorf("not a member of this conversation")
+	}
+
+	// 3. 幂等处理：检查是否已存在相同 ACK
+	serverTS := time.Now().UnixMilli()
+	existingACK, err := s.msgRepo.GetACKByMsgIDAndUser(ack.MsgID, userID, ack.ACKType)
+	if err == nil && existingACK != nil {
+		// 重复 ACK，返回成功但不重复写入
+		logger.Debug("Duplicate ACK received",
+			"msg_id", ack.MsgID,
+			"user_id", userID,
+			"ack_type", ack.ACKType)
+		
+		return &message.ClientACKResponse{
+			MsgID:    ack.MsgID,
+			ACKType:  ack.ACKType,
+			ServerTS: existingACK.ACKTS,
+			Duplicate: true,
+		}, nil
+	}
+
+	// 4. 创建 ACK 记录（幂等）
+	ackRecord := &message.MessageACK{
+		MsgID:          ack.MsgID,
+		UserID:         userID,
+		ConversationID: ack.ConversationID,
+		ACKType:        ack.ACKType,
+		ACKTS:          serverTS,
+		CreatedAt:      time.Now(),
+		UpdatedAt:      time.Now(),
+	}
+
+	if err := s.msgRepo.CreateOrUpdateACK(ackRecord); err != nil {
+		return nil, fmt.Errorf("failed to save ACK: %w", err)
+	}
+
+	// 5. 更新消息状态
+	if ack.ACKType == message.ACKTypeDelivered {
+		// 更新为已送达
+		if err := s.msgRepo.UpdateMessageStatus(ack.MsgID, message.MsgStatusDelivered); err != nil {
+			logger.Warn("Failed to update message status to delivered",
+				"msg_id", ack.MsgID,
+				"error", err)
+		}
+	} else if ack.ACKType == message.ACKTypeRead {
+		// 更新为已读
+		if err := s.msgRepo.UpdateMessageStatus(ack.MsgID, message.MsgStatusRead); err != nil {
+			logger.Warn("Failed to update message status to read",
+				"msg_id", ack.MsgID,
+				"error", err)
+		}
+		
+		// 同时更新用户游标
+		cursor := &message.UserCursor{
+			UserID:         userID,
+			ConversationID: ack.ConversationID,
+			LastReadMsgID:  ack.MsgID,
+			LastReadTS:     msg.ServerTS,
+			UpdatedAt:      time.Now(),
+		}
+		if err := s.msgRepo.UpsertUserCursor(cursor); err != nil {
+			logger.Warn("Failed to update user cursor",
+				"user_id", userID,
+				"error", err)
+		}
+	}
+
+	// 6. 通知消息发送方（可选：通过 WebSocket 或其他方式）
+	// 这里可以通知消息发送方消息已送达/已读
+
+	logger.Info("ACK processed",
+		"msg_id", ack.MsgID,
+		"user_id", userID,
+		"conversation_id", ack.ConversationID,
+		"ack_type", ack.ACKType)
+
+	return &message.ClientACKResponse{
+		MsgID:     ack.MsgID,
+		ACKType:   ack.ACKType,
+		ServerTS:  serverTS,
+		Duplicate: false,
+	}, nil
+}
+
+// SyncACKs 同步 ACK 状态（用于 ACK 丢失补偿）
+func (s *MessageService) SyncACKs(ctx context.Context, userID string, req *message.ACKSyncRequest) (*message.ACKSyncResponse, error) {
+	// 验证用户是否为会话成员
+	isMember, err := s.msgRepo.IsConversationMember(req.ConversationID, userID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to check membership: %w", err)
+	}
+	if !isMember {
+		return nil, fmt.Errorf("not a member of this conversation")
+	}
+
+	response := &message.ACKSyncResponse{
+		DeliveredACKs: []message.MessageACK{},
+		ReadACKs:      []message.MessageACK{},
+		MissedCount:   0,
+	}
+
+	// 如果未指定 ACK 类型，默认查询所有
+	if len(req.ACKTypes) == 0 {
+		req.ACKTypes = []message.ACKType{message.ACKTypeDelivered, message.ACKTypeRead}
+	}
+
+	// 遍历需要同步的 ACK 类型
+	for _, ackType := range req.ACKTypes {
+		// 获取服务端在该时间点之后的 ACK
+		acks, err := s.msgRepo.GetACKsByConversation(userID, req.ConversationID, req.LastACKTS, ackType)
+		if err != nil {
+			logger.Warn("Failed to get ACKs for sync",
+				"conversation_id", req.ConversationID,
+				"ack_type", ackType,
+				"error", err)
+			continue
+		}
+
+		// 过滤掉客户端已知的 ACK（通过 lastAckMsgID）
+		var missedACKs []message.MessageACK
+		for _, ack := range acks {
+			if ack.MsgID != req.LastACKMsgID {
+				missedACKs = append(missedACKs, ack)
+			}
+		}
+
+		response.MissedCount += len(missedACKs)
+
+		if ackType == message.ACKTypeDelivered {
+			response.DeliveredACKs = missedACKs
+		} else if ackType == message.ACKTypeRead {
+			response.ReadACKs = missedACKs
+		}
+	}
+
+	logger.Info("ACK sync completed",
+		"user_id", userID,
+		"conversation_id", req.ConversationID,
+		"missed_count", response.MissedCount)
+
+	return response, nil
+}
+
+// CleanupOldACKs 清理过期的 ACK（回执表膨胀处理）
+func (s *MessageService) CleanupOldACKs(retentionDays int) (int64, error) {
+	// 默认保留 7 天
+	if retentionDays <= 0 {
+		retentionDays = 7
+	}
+
+	deletedCount, err := s.msgRepo.DeleteOldACKs(retentionDays)
+	if err != nil {
+		logger.Error("Failed to cleanup old ACKs",
+			"error", err)
+		return 0, err
+	}
+
+	logger.Info("Old ACKs cleaned up",
+		"deleted_count", deletedCount,
+		"retention_days", retentionDays)
+
+	return deletedCount, nil
+}
+
+// GetACKStats 获取 ACK 统计信息
+func (s *MessageService) GetACKStats() (map[string]int64, error) {
+	stats := make(map[string]int64)
+
+	// 总 ACK 数量
+	total, err := s.msgRepo.GetACKCount()
+	if err != nil {
+		return nil, err
+	}
+	stats["total"] = total
+
+	// 按类型统计
+	deliveredCount, err := s.msgRepo.GetACKCountByType(message.ACKTypeDelivered)
+	if err != nil {
+		return nil, err
+	}
+	stats["delivered"] = deliveredCount
+
+	readCount, err := s.msgRepo.GetACKCountByType(message.ACKTypeRead)
+	if err != nil {
+		return nil, err
+	}
+	stats["read"] = readCount
+
+	return stats, nil
+}
+
+// NotifyMessageDelivered 通知消息已送达（当消息投递成功时调用）
+func (s *MessageService) NotifyMessageDelivered(msgID, conversationID, toUserID string) error {
+	// 创建送达 ACK
+	serverTS := time.Now().UnixMilli()
+	ack := &message.MessageACK{
+		MsgID:          msgID,
+		UserID:         toUserID,
+		ConversationID: conversationID,
+		ACKType:        message.ACKTypeDelivered,
+		ACKTS:          serverTS,
+		CreatedAt:      time.Now(),
+		UpdatedAt:      time.Now(),
+	}
+
+	// 幂等写入
+	if err := s.msgRepo.CreateOrUpdateACK(ack); err != nil {
+		return fmt.Errorf("failed to create delivered ACK: %w", err)
+	}
+
+	// 更新消息状态
+	if err := s.msgRepo.UpdateMessageStatus(msgID, message.MsgStatusDelivered); err != nil {
+		logger.Warn("Failed to update message status to delivered",
+			"msg_id", msgID,
+			"error", err)
+	}
+
+	logger.Info("Message delivered notification processed",
+		"msg_id", msgID,
+		"to_user_id", toUserID)
+
+	return nil
+}
+
+// ========== Gateway 适配器方法 ==========
+// 用于处理来自 Gateway 的 ACK 请求（类型转换）
+
+// ProcessGatewayACK 处理来自 Gateway 的 ACK 请求（适配器）
+func (s *MessageService) ProcessGatewayACK(ctx context.Context, userID string, ack *gateway.ClientACKMessage) (*message.ClientACKResponse, error) {
+	// 转换为 message.ClientACK
+	msgACK := &message.ClientACK{
+		MsgID:          ack.MsgID,
+		ConversationID: ack.ConversationID,
+		ACKType:        message.ACKType(ack.ACKType),
+	}
+	return s.ProcessACK(ctx, userID, msgACK)
+}
+
+// SyncGatewayACKs 处理来自 Gateway 的 ACK 同步请求（适配器）
+func (s *MessageService) SyncGatewayACKs(ctx context.Context, userID string, req *gateway.ACKSyncRequestMessage) (*message.ACKSyncResponse, error) {
+	// 转换为 message.ACKSyncRequest
+	ackTypes := make([]message.ACKType, len(req.ACKTypes))
+	for i, t := range req.ACKTypes {
+		ackTypes[i] = message.ACKType(t)
+	}
+
+	syncReq := &message.ACKSyncRequest{
+		ConversationID: req.ConversationID,
+		LastACKMsgID:   req.LastACKMsgID,
+		LastACKTS:      req.LastACKTS,
+		ACKTypes:       ackTypes,
+	}
+	return s.SyncACKs(ctx, userID, syncReq)
+}

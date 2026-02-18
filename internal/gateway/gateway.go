@@ -47,6 +47,10 @@ const (
 	MsgTypeOfflineMsgs  MessageType = "offline_msgs"    // 离线消息响应
 	MsgTypeSyncCursor   MessageType = "sync_cursor"    // 同步游标
 	MsgTypeReconnect    MessageType = "reconnect"      // 重连通知
+	MsgTypeACK          MessageType = "ack"            // 客户端 ACK（送达/已读回执）
+	MsgTypeACKResponse  MessageType = "ack_response"  // 服务端 ACK 响应
+	MsgTypeACKSync      MessageType = "ack_sync"       // ACK 同步请求（补偿）
+	MsgTypeACKSyncResp  MessageType = "ack_sync_resp"  // ACK 同步响应
 )
 
 // BaseMessage 基础消息结构
@@ -99,6 +103,10 @@ type Hub struct {
 		SendMessage(ctx context.Context, fromUserID string, req *message.SendMessageRequest) (*message.SendMessageResponse, error)
 		// 拉取离线消息
 		PullOfflineMessages(ctx context.Context, userID string, lastTS int64, limit int) ([]message.Message, error)
+		// ACK 处理（适配器方法，接受 gateway 类型）
+		ProcessGatewayACK(ctx context.Context, userID string, ack *ClientACKMessage) (*message.ClientACKResponse, error)
+		// ACK 同步（适配器方法，接受 gateway 类型）
+		SyncGatewayACKs(ctx context.Context, userID string, req *ACKSyncRequestMessage) (*message.ACKSyncResponse, error)
 	}
 
 	// Redis 在线状态管理
@@ -518,6 +526,10 @@ func (c *Connection) handleMessage(data []byte) {
 		c.handlePullOffline(data)
 	case MsgTypeSyncCursor:
 		c.handleSyncCursor(data)
+	case MsgTypeACK:
+		c.handleACK(data)
+	case MsgTypeACKSync:
+		c.handleACKSync(data)
 	default:
 		logger.Warn("Unknown message type",
 			"conn_id", c.ID,
@@ -752,6 +764,177 @@ func (c *Connection) handleSyncCursor(data []byte) {
 		"user_id", c.UserID,
 		"conversation_id", reqMsg.Payload.ConversationID)
 }
+
+// handleACK 处理客户端 ACK（送达/已读回执）
+func (c *Connection) handleACK(data []byte) {
+	if !c.IsAuth.Load() {
+		c.sendError(401, "Not authenticated")
+		return
+	}
+
+	var reqMsg struct {
+		Type    MessageType `json:"type"`
+		Payload struct {
+			MsgID          string `json:"msg_id"`
+			ConversationID string `json:"conversation_id"`
+			ACKType        string `json:"ack_type"` // "delivered" or "read"
+		} `json:"payload"`
+	}
+
+	if err := json.Unmarshal(data, &reqMsg); err != nil {
+		c.sendError(400, "Invalid ACK request")
+		return
+	}
+
+	// 验证参数
+	if reqMsg.Payload.MsgID == "" || reqMsg.Payload.ConversationID == "" {
+		c.sendError(400, "Missing required fields")
+		return
+	}
+
+	// 验证 ACK 类型
+	ackType := reqMsg.Payload.ACKType
+	if ackType != "delivered" && ackType != "read" {
+		c.sendError(400, "Invalid ACK type")
+		return
+	}
+
+	// 检查 Hub 是否有消息服务
+	if c.Hub.MessageService == nil {
+		c.sendError(500, "Message service not available")
+		return
+	}
+
+	// 调用服务处理 ACK（使用适配器方法）
+	ack := &ClientACKMessage{
+		MsgID:          reqMsg.Payload.MsgID,
+		ConversationID: reqMsg.Payload.ConversationID,
+		ACKType:        ackType,
+	}
+
+	resp, err := c.Hub.MessageService.ProcessGatewayACK(context.Background(), c.UserID, ack)
+	if err != nil {
+		logger.Warn("Failed to process ACK",
+			"msg_id", reqMsg.Payload.MsgID,
+			"user_id", c.UserID,
+			"error", err)
+		c.sendError(500, "Failed to process ACK: "+err.Error())
+		return
+	}
+
+	// 发送 ACK 响应
+	ackResp := BaseMessage{
+		Type: MsgTypeACKResponse,
+		Payload: map[string]interface{}{
+			"msg_id":     resp.MsgID,
+			"ack_type":   resp.ACKType,
+			"server_ts":  resp.ServerTS,
+			"duplicate":  resp.Duplicate,
+		},
+	}
+	ackRespData, _ := json.Marshal(ackResp)
+	c.Send <- ackRespData
+
+	logger.Debug("ACK processed",
+		"msg_id", reqMsg.Payload.MsgID,
+		"user_id", c.UserID,
+		"ack_type", ackType,
+		"duplicate", resp.Duplicate)
+}
+
+// handleACKSync 处理 ACK 同步请求（ACK 丢失补偿）
+func (c *Connection) handleACKSync(data []byte) {
+	if !c.IsAuth.Load() {
+		c.sendError(401, "Not authenticated")
+		return
+	}
+
+	var reqMsg struct {
+		Type    MessageType `json:"type"`
+		Payload struct {
+			ConversationID string   `json:"conversation_id"`
+			LastACKMsgID   string   `json:"last_ack_msg_id"`
+			LastACKTS      int64    `json:"last_ack_ts"`
+			ACKTypes       []string `json:"ack_types"`
+		} `json:"payload"`
+	}
+
+	if err := json.Unmarshal(data, &reqMsg); err != nil {
+		c.sendError(400, "Invalid ACK sync request")
+		return
+	}
+
+	// 验证参数
+	if reqMsg.Payload.ConversationID == "" {
+		c.sendError(400, "Missing conversation_id")
+		return
+	}
+
+	// 检查 Hub 是否有消息服务
+	if c.Hub.MessageService == nil {
+		c.sendError(500, "Message service not available")
+		return
+	}
+
+	// 转换 ACK 类型
+	var ackTypes []ACKTypeMessage
+	for _, t := range reqMsg.Payload.ACKTypes {
+		ackTypes = append(ackTypes, ACKTypeMessage(t))
+	}
+
+	// 调用服务同步 ACK（使用适配器方法）
+	syncReq := &ACKSyncRequestMessage{
+		ConversationID: reqMsg.Payload.ConversationID,
+		LastACKMsgID:  reqMsg.Payload.LastACKMsgID,
+		LastACKTS:      reqMsg.Payload.LastACKTS,
+		ACKTypes:       ackTypes,
+	}
+
+	resp, err := c.Hub.MessageService.SyncGatewayACKs(context.Background(), c.UserID, syncReq)
+	if err != nil {
+		logger.Warn("Failed to sync ACKs",
+			"conversation_id", reqMsg.Payload.ConversationID,
+			"user_id", c.UserID,
+			"error", err)
+		c.sendError(500, "Failed to sync ACKs: "+err.Error())
+		return
+	}
+
+	// 发送同步响应
+	syncResp := BaseMessage{
+		Type: MsgTypeACKSyncResp,
+		Payload: map[string]interface{}{
+			"delivered_acks": resp.DeliveredACKs,
+			"read_acks":      resp.ReadACKs,
+			"missed_count":  resp.MissedCount,
+		},
+	}
+	syncRespData, _ := json.Marshal(syncResp)
+	c.Send <- syncRespData
+
+	logger.Debug("ACK sync completed",
+		"conversation_id", reqMsg.Payload.ConversationID,
+		"user_id", c.UserID,
+		"missed_count", resp.MissedCount)
+}
+
+// ClientACKMessage 客户端 ACK 消息结构（用于传递给服务）
+type ClientACKMessage struct {
+	MsgID          string
+	ConversationID string
+	ACKType        string
+}
+
+// ACKSyncRequestMessage ACK 同步请求结构
+type ACKSyncRequestMessage struct {
+	ConversationID string
+	LastACKMsgID  string
+	LastACKTS      int64
+	ACKTypes       []ACKTypeMessage
+}
+
+// ACKTypeMessage ACK 类型
+type ACKTypeMessage string
 
 // sendError 发送错误消息
 func (c *Connection) sendError(code int, message string) {
