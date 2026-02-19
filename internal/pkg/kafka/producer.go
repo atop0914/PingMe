@@ -15,12 +15,14 @@ type MessageData struct {
 	MsgID          string `json:"msg_id"`
 	ConversationID string `json:"conversation_id"`
 	FromUserID     string `json:"from_user_id"`
-	ToUserID       string `json:"to_user_id"`
+	ToUserID       string `json:"to_user_id"`     // 单聊时使用
+	GroupID        string `json:"group_id"`       // 群聊时使用
 	Content        string `json:"content"`
 	ContentType    string `json:"content_type"`
 	ClientTS       int64  `json:"client_ts"`
 	ServerTS       int64  `json:"server_ts"`
 	Status         string `json:"status"`
+	IsGroup        bool   `json:"is_group"` // 是否为群消息
 }
 
 // DeliveryEvent 投递事件

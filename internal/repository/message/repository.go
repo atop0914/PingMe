@@ -478,3 +478,71 @@ func generatePrivateConversationID(userID1, userID2 string) string {
 	}
 	return "private:" + userID2 + ":" + userID1
 }
+
+// ========== 群组相关方法 ==========
+
+// CreateGroup 创建群组
+func (r *Repository) CreateGroup(conversationID, groupID, groupName, ownerUserID string, members []msgmodel.ConversationMember) error {
+	tx := r.db.Begin()
+
+	// 创建群会话
+	conv := msgmodel.Conversation{
+		ConversationID: conversationID,
+		Type:           msgmodel.ConvTypeGroup,
+		Name:           groupName,
+		OwnerUserID:    ownerUserID,
+		CreatedAt:      time.Now(),
+		UpdatedAt:      time.Now(),
+	}
+
+	if err := tx.Create(&conv).Error; err != nil {
+		tx.Rollback()
+		return err
+	}
+
+	// 添加成员
+	if err := tx.Create(&members).Error; err != nil {
+		tx.Rollback()
+		return err
+	}
+
+	tx.Commit()
+	return nil
+}
+
+// GetGroupByGroupID 根据 groupID 获取群会话
+func (r *Repository) GetGroupByGroupID(groupID string) (*msgmodel.Conversation, error) {
+	conversationID := "group:" + groupID
+	var conv msgmodel.Conversation
+	err := r.db.Where("conversation_id = ? AND type = ?", conversationID, msgmodel.ConvTypeGroup).First(&conv).Error
+	if err != nil {
+		return nil, err
+	}
+	return &conv, nil
+}
+
+// AddGroupMember 添加群成员
+func (r *Repository) AddGroupMember(member *msgmodel.ConversationMember) error {
+	return r.db.Create(member).Error
+}
+
+// RemoveGroupMember 移除群成员
+func (r *Repository) RemoveGroupMember(conversationID, userID string) error {
+	return r.db.Where("conversation_id = ? AND user_id = ?", conversationID, userID).
+		Delete(&msgmodel.ConversationMember{}).Error
+}
+
+// GetGroupMembers 获取群成员列表
+func (r *Repository) GetGroupMembers(groupID string) ([]msgmodel.ConversationMember, error) {
+	conversationID := "group:" + groupID
+	var members []msgmodel.ConversationMember
+	err := r.db.Where("conversation_id = ?", conversationID).Find(&members).Error
+	return members, err
+}
+
+// GetGroupMembersByConversationID 根据会话ID获取群成员
+func (r *Repository) GetGroupMembersByConversationID(conversationID string) ([]msgmodel.ConversationMember, error) {
+	var members []msgmodel.ConversationMember
+	err := r.db.Where("conversation_id = ?", conversationID).Find(&members).Error
+	return members, err
+}

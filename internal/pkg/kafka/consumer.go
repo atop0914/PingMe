@@ -361,6 +361,7 @@ func (h *KafkaMessageConsumer) HandleMessage(ctx context.Context, msg *MessageDa
 		ConversationID: msg.ConversationID,
 		FromUserID:     msg.FromUserID,
 		ToUserID:       msg.ToUserID,
+		GroupID:        msg.GroupID,
 		Content:        msg.Content,
 		ContentType:    message.MessageType(msg.ContentType),
 		Status:         message.MessageStatus(msg.Status),
@@ -377,21 +378,31 @@ func (h *KafkaMessageConsumer) HandleMessage(ctx context.Context, msg *MessageDa
 		return fmt.Errorf("failed to create message: %w (code: %s)", err, errorcode.KafkaMessagePersistError.Code)
 	}
 
-	// 尝试实时投递
-	delivered := h.deliverMessage(ctx, msg.ToUserID, msg)
+	// 根据消息类型处理投递
+	if msg.IsGroup {
+		// 群消息：广播给所有成员
+		delivered := h.deliverGroupMessage(ctx, msg)
+		logger.Info("Group message processed",
+			"msg_id", msg.MsgID,
+			"group_id", msg.GroupID,
+			"delivered", delivered)
+	} else {
+		// 单聊消息：投递给他人
+		delivered := h.deliverMessage(ctx, msg.ToUserID, msg)
 
-	// 更新消息状态
-	if delivered {
-		msgModel.Status = message.MsgStatusDelivered
-		h.msgRepo.UpdateMessageStatus(msg.MsgID, message.MsgStatusDelivered)
-		
-		// 生成投递事件
-		h.generateDeliveryEvent(msg)
+		// 更新消息状态
+		if delivered {
+			msgModel.Status = message.MsgStatusDelivered
+			h.msgRepo.UpdateMessageStatus(msg.MsgID, message.MsgStatusDelivered)
+			
+			// 生成投递事件
+			h.generateDeliveryEvent(msg)
+		}
 	}
 
 	logger.Info("Message processed",
 		"msg_id", msg.MsgID,
-		"delivered", delivered,
+		"is_group", msg.IsGroup,
 		"delivery_semantic", "at-least-once")
 
 	return nil
@@ -446,6 +457,62 @@ func (h *KafkaMessageConsumer) generateDeliveryEvent(msg *MessageData) {
 		"msg_id", event.MsgID,
 		"to_user_id", event.ToUserID,
 		"delivered_at", event.DeliveredAt)
+}
+
+// deliverGroupMessage 投递群消息
+// 优化：批量处理，避免逐成员同步调用
+func (h *KafkaMessageConsumer) deliverGroupMessage(ctx context.Context, msg *MessageData) bool {
+	if msg.GroupID == "" {
+		return false
+	}
+
+	// 获取群成员
+	conversationID := "group:" + msg.GroupID
+	members, err := h.msgRepo.GetGroupMembersByConversationID(conversationID)
+	if err != nil {
+		logger.Error("Failed to get group members for delivery",
+			"group_id", msg.GroupID,
+			"error", err)
+		return false
+	}
+
+	// 构建推送消息
+	pushMsg := map[string]interface{}{
+		"type": "group_message",
+		"payload": map[string]interface{}{
+			"msg_id":          msg.MsgID,
+			"conversation_id": msg.ConversationID,
+			"group_id":        msg.GroupID,
+			"from_user_id":    msg.FromUserID,
+			"content":         msg.Content,
+			"content_type":    msg.ContentType,
+			"status":          "delivered",
+			"server_ts":       msg.ServerTS,
+			"client_ts":       msg.ClientTS,
+		},
+	}
+	data, _ := json.Marshal(pushMsg)
+
+	// 发送给所有成员（除了发送者）
+	deliveredCount := 0
+	for _, member := range members {
+		if member.UserID == msg.FromUserID {
+			continue // 不发给自己
+		}
+
+		if h.hub != nil {
+			h.hub.SendToUser(member.UserID, data)
+			deliveredCount++
+		}
+	}
+
+	logger.Info("Group message delivered",
+		"msg_id", msg.MsgID,
+		"group_id", msg.GroupID,
+		"total_members", len(members),
+		"delivered_count", deliveredCount)
+
+	return deliveredCount > 0
 }
 
 // HandleDeliveryEvent 处理投递事件（可扩展，用于推送通知等）

@@ -715,3 +715,456 @@ func (s *MessageService) SyncGatewayACKs(ctx context.Context, userID string, req
 	}
 	return s.SyncACKs(ctx, userID, syncReq)
 }
+
+// ========== 群组相关方法 ==========
+
+// GroupService 群组服务
+type GroupService struct {
+	msgRepo      *msgrepo.Repository
+	userRepo     *user.Repository
+	hub          *gateway.Hub
+	kafkaProducer *kafka2.Producer
+}
+
+// NewGroupService 创建群组服务
+func NewGroupService(msgRepo *msgrepo.Repository, userRepo *user.Repository, hub *gateway.Hub, producer *kafka2.Producer) *GroupService {
+	return &GroupService{
+		msgRepo:      msgRepo,
+		userRepo:     userRepo,
+		hub:          hub,
+		kafkaProducer: producer,
+	}
+}
+
+// CreateGroup 创建群组
+func (s *GroupService) CreateGroup(ctx context.Context, ownerUserID, groupName string, memberIDs []string) (*CreateGroupResponse, error) {
+	// 生成群 ID
+	groupID := "group:" + uuid.New().String()
+	conversationID := "group:" + groupID
+
+	// 构建成员列表（包含创建者）
+	memberSet := make(map[string]bool)
+	memberSet[ownerUserID] = true
+	for _, id := range memberIDs {
+		memberSet[id] = true
+	}
+
+	members := make([]message.ConversationMember, 0, len(memberSet))
+	for userID := range memberSet {
+		role := "member"
+		if userID == ownerUserID {
+			role = "owner"
+		}
+		members = append(members, message.ConversationMember{
+			ConversationID: conversationID,
+			UserID:         userID,
+			Role:           role,
+			JoinedAt:       time.Now(),
+			CreatedAt:      time.Now(),
+			UpdatedAt:      time.Now(),
+		})
+	}
+
+	// 事务创建
+	err := s.msgRepo.CreateGroup(conversationID, groupID, groupName, ownerUserID, members)
+	if err != nil {
+		logger.Error("Failed to create group",
+			"owner_user_id", ownerUserID,
+			"group_name", groupName,
+			"error", err)
+		return nil, fmt.Errorf("failed to create group: %w", err)
+	}
+
+	logger.Info("Group created",
+		"group_id", groupID,
+		"owner_user_id", ownerUserID,
+		"name", groupName,
+		"member_count", len(members))
+
+	// 返回成员ID列表
+	memberIDList := make([]string, len(members))
+	for i, m := range members {
+		memberIDList[i] = m.UserID
+	}
+
+	return &CreateGroupResponse{
+		GroupID:        groupID,
+		Name:           groupName,
+		ConversationID: conversationID,
+		OwnerUserID:    ownerUserID,
+		MemberIDs:      memberIDList,
+		CreatedAt:      time.Now().UnixMilli(),
+	}, nil
+}
+
+// JoinGroup 加群
+func (s *GroupService) JoinGroup(ctx context.Context, userID, groupID string) error {
+	// 获取群会话ID
+	conversationID := "group:" + groupID
+
+	// 检查群是否存在
+	conv, err := s.msgRepo.GetGroupByGroupID(groupID)
+	if err != nil {
+		if err == gorm.ErrRecordNotFound {
+			return fmt.Errorf("group not found")
+		}
+		return fmt.Errorf("failed to get group: %w", err)
+	}
+
+	// 检查是否已经是成员
+	isMember, err := s.msgRepo.IsConversationMember(conversationID, userID)
+	if err != nil {
+		return fmt.Errorf("failed to check membership: %w", err)
+	}
+	if isMember {
+		return fmt.Errorf("already a group member")
+	}
+
+	// 添加成员
+	member := &message.ConversationMember{
+		ConversationID: conversationID,
+		UserID:         userID,
+		Role:           "member",
+		JoinedAt:       time.Now(),
+		CreatedAt:      time.Now(),
+		UpdatedAt:      time.Now(),
+	}
+
+	if err := s.msgRepo.AddGroupMember(member); err != nil {
+		logger.Error("Failed to join group",
+			"user_id", userID,
+			"group_id", groupID,
+			"error", err)
+		return fmt.Errorf("failed to join group: %w", err)
+	}
+
+	logger.Info("User joined group",
+		"user_id", userID,
+		"group_id", groupID,
+		"group_name", conv.Name)
+
+	return nil
+}
+
+// LeaveGroup 退群
+func (s *GroupService) LeaveGroup(ctx context.Context, userID, groupID string) error {
+	conversationID := "group:" + groupID
+
+	// 检查群是否存在
+	conv, err := s.msgRepo.GetGroupByGroupID(groupID)
+	if err != nil {
+		if err == gorm.ErrRecordNotFound {
+			return fmt.Errorf("group not found")
+		}
+		return fmt.Errorf("failed to get group: %w", err)
+	}
+
+	// 群主不能退群（只能解散群）
+	if conv.OwnerUserID == userID {
+		return fmt.Errorf("owner cannot leave group, please dissolve the group instead")
+	}
+
+	// 检查是否是成员
+	isMember, err := s.msgRepo.IsConversationMember(conversationID, userID)
+	if err != nil {
+		return fmt.Errorf("failed to check membership: %w", err)
+	}
+	if !isMember {
+		return fmt.Errorf("not a group member")
+	}
+
+	// 移除成员
+	if err := s.msgRepo.RemoveGroupMember(conversationID, userID); err != nil {
+		logger.Error("Failed to leave group",
+			"user_id", userID,
+			"group_id", groupID,
+			"error", err)
+		return fmt.Errorf("failed to leave group: %w", err)
+	}
+
+	logger.Info("User left group",
+		"user_id", userID,
+		"group_id", groupID)
+
+	return nil
+}
+
+// GetGroupMembers 获取群成员列表
+func (s *GroupService) GetGroupMembers(groupID string) ([]message.ConversationMember, error) {
+	conversationID := "group:" + groupID
+	return s.msgRepo.GetConversationMembers(conversationID)
+}
+
+// GetGroupMembersWithStatus 获取群成员列表（带在线状态）
+func (s *GroupService) GetGroupMembersWithStatus(ctx context.Context, groupID string, limit int) ([]GroupMemberWithStatus, error) {
+	conversationID := "group:" + groupID
+
+	// 获取所有成员
+	members, err := s.msgRepo.GetConversationMembers(conversationID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get members: %w", err)
+	}
+
+	// 限制返回数量
+	if len(members) > limit {
+		members = members[:limit]
+	}
+
+	// 构建结果
+	result := make([]GroupMemberWithStatus, len(members))
+	for i, member := range members {
+		online := false
+
+		// 检查本地连接
+		conns := s.hub.GetUserConnections(member.UserID)
+		if conns != nil && len(conns) > 0 {
+			online = true
+		} else if s.hub.RedisClient != nil {
+			// 检查 Redis 在线状态
+			presence, _ := s.hub.RedisClient.GetUserPresence(ctx, member.UserID)
+			online = presence != nil
+		}
+
+		result[i] = GroupMemberWithStatus{
+			UserID:   member.UserID,
+			Role:     member.Role,
+			JoinedAt: member.JoinedAt.UnixMilli(),
+			Online:   online,
+		}
+	}
+
+	return result, nil
+}
+
+// IsGroupMember 检查用户是否为群成员
+func (s *GroupService) IsGroupMember(groupID, userID string) (bool, error) {
+	conversationID := "group:" + groupID
+	return s.msgRepo.IsConversationMember(conversationID, userID)
+}
+
+// GetUserGroups 获取用户加入的群组列表
+func (s *GroupService) GetUserGroups(ctx context.Context, userID string, limit int, cursor string) (*message.GetConversationsResponse, error) {
+	// 复用 GetConversations 方法，筛选群组类型
+	convs, nextCursor, err := s.msgRepo.GetUserConversations(userID, limit, cursor)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get conversations: %w", err)
+	}
+
+	// 过滤群组类型并转换
+	var groupConvs []message.ConversationWithLastMessage
+	for _, conv := range convs {
+		if conv.Type == message.ConvTypeGroup {
+			groupConvs = append(groupConvs, message.ConversationWithLastMessage{
+				Conversation: conv,
+			})
+		}
+	}
+
+	return &message.GetConversationsResponse{
+		Conversations: groupConvs,
+		HasMore:       nextCursor != "",
+		NextCursor:    nextCursor,
+	}, nil
+}
+
+// GetGroupInfo 获取群组详情
+func (s *GroupService) GetGroupInfo(groupID string) (*message.Conversation, error) {
+	conversationID := "group:" + groupID
+	return s.msgRepo.GetConversationByID(conversationID)
+}
+
+// SendGroupMessage 发送群消息
+func (s *GroupService) SendGroupMessage(ctx context.Context, fromUserID, groupID, content string, contentType message.MessageType, clientTS int64) (*SendGroupMessageResponse, error) {
+	conversationID := "group:" + groupID
+
+	// 检查群是否存在
+	conv, err := s.msgRepo.GetGroupByGroupID(groupID)
+	if err != nil {
+		if err == gorm.ErrRecordNotFound {
+			return nil, fmt.Errorf("group not found")
+		}
+		return nil, fmt.Errorf("failed to get group: %w", err)
+	}
+
+	// 创建消息
+	msg := &message.Message{
+		MsgID:          uuid.New().String(),
+		ConversationID: conversationID,
+		FromUserID:     fromUserID,
+		GroupID:        groupID,
+		Content:         content,
+		ContentType:    contentType,
+		Status:         message.MsgStatusSending,
+		ClientTS:       clientTS,
+		ServerTS:       time.Now().UnixMilli(),
+	}
+
+	// 如果有 Kafka producer，发送到 Kafka
+	if s.kafkaProducer != nil {
+		kafkaMsg := &kafka2.MessageData{
+			MsgID:          msg.MsgID,
+			ConversationID: msg.ConversationID,
+			FromUserID:     msg.FromUserID,
+			GroupID:        msg.GroupID,
+			Content:        msg.Content,
+			ContentType:    string(msg.ContentType),
+			ClientTS:       msg.ClientTS,
+			ServerTS:       msg.ServerTS,
+			Status:         string(msg.Status),
+			IsGroup:        true,
+		}
+
+		if err := s.kafkaProducer.SendMessage(kafkaMsg); err != nil {
+			logger.Error("Failed to send group message to Kafka",
+				"msg_id", msg.MsgID,
+				"error", err)
+			// Kafka 发送失败，回退到直接落库
+			if dbErr := s.msgRepo.CreateMessage(msg); dbErr != nil {
+				logger.Error("Failed to create group message",
+					"error", dbErr)
+				return nil, fmt.Errorf("failed to create message: %w", dbErr)
+			}
+		} else {
+			logger.Info("Group message sent to Kafka",
+				"msg_id", msg.MsgID,
+				"conversation_id", conversationID,
+				"group_id", groupID)
+		}
+	} else {
+		// 没有 Kafka，直接落库
+		if err := s.msgRepo.CreateMessage(msg); err != nil {
+			logger.Error("Failed to create group message",
+				"error", err)
+			return nil, fmt.Errorf("failed to create message: %w", err)
+		}
+	}
+
+	// 更新群最后活跃时间
+	s.msgRepo.UpdateConversationTime(conversationID)
+
+	// 异步广播消息给群成员（优化：避免阻塞）
+	go s.broadcastGroupMessage(msg, conv)
+
+	logger.Info("Group message sent",
+		"msg_id", msg.MsgID,
+		"from_user_id", fromUserID,
+		"group_id", groupID,
+		"group_name", conv.Name)
+
+	return &SendGroupMessageResponse{
+		MsgID:          msg.MsgID,
+		ConversationID: conversationID,
+		Status:         string(msg.Status),
+		ServerTS:       msg.ServerTS,
+	}, nil
+}
+
+// broadcastGroupMessage 广播群消息（异步）
+// 优化：采用批量投递策略，避免逐成员同步调用
+func (s *GroupService) broadcastGroupMessage(msg *message.Message, conv *message.Conversation) {
+	// 获取群成员
+	members, err := s.msgRepo.GetConversationMembers(msg.ConversationID)
+	if err != nil {
+		logger.Error("Failed to get group members for broadcast",
+			"group_id", msg.GroupID,
+			"error", err)
+		return
+	}
+
+	// 构建消息体
+	msgData := s.buildGroupPushMessage(msg)
+
+	// 统计在线/离线成员
+	var onlineMembers []string
+	var offlineMembers []string
+
+	for _, member := range members {
+		// 跳过自己
+		if member.UserID == msg.FromUserID {
+			continue
+		}
+
+		// 检查是否在线
+		conns := s.hub.GetUserConnections(member.UserID)
+		if conns != nil && len(conns) > 0 {
+			onlineMembers = append(onlineMembers, member.UserID)
+		} else if s.hub.RedisClient != nil {
+			// 检查 Redis
+			presence, err := s.hub.RedisClient.GetUserPresence(context.Background(), member.UserID)
+			if err == nil && presence != nil {
+				onlineMembers = append(onlineMembers, member.UserID)
+			} else {
+				offlineMembers = append(offlineMembers, member.UserID)
+			}
+		} else {
+			offlineMembers = append(offlineMembers, member.UserID)
+		}
+	}
+
+	// 批量发送在线成员（优化：减少锁竞争）
+	for _, userID := range onlineMembers {
+		conns := s.hub.GetUserConnections(userID)
+		if conns != nil {
+			for _, conn := range conns {
+				select {
+				case conn.Send <- msgData:
+				default:
+					logger.Warn("Connection send buffer full during group broadcast",
+						"conn_id", conn.ID,
+						"user_id", userID)
+				}
+			}
+		}
+	}
+
+	logger.Info("Group message broadcast completed",
+		"msg_id", msg.MsgID,
+		"group_id", msg.GroupID,
+		"total_members", len(members),
+		"online_count", len(onlineMembers),
+		"offline_count", len(offlineMembers))
+}
+
+// buildGroupPushMessage 构建群消息推送体
+func (s *GroupService) buildGroupPushMessage(msg *message.Message) []byte {
+	pushMsg := map[string]interface{}{
+		"type": "group_message",
+		"payload": map[string]interface{}{
+			"msg_id":          msg.MsgID,
+			"conversation_id": msg.ConversationID,
+			"group_id":        msg.GroupID,
+			"from_user_id":    msg.FromUserID,
+			"content":         msg.Content,
+			"content_type":    msg.ContentType,
+			"status":          msg.Status,
+			"server_ts":       msg.ServerTS,
+			"client_ts":       msg.ClientTS,
+		},
+	}
+	data, _ := json.Marshal(pushMsg)
+	return data
+}
+
+// 辅助类型定义
+type CreateGroupResponse struct {
+	GroupID        string   `json:"group_id"`
+	Name           string   `json:"name"`
+	ConversationID string   `json:"conversation_id"`
+	OwnerUserID    string   `json:"owner_user_id"`
+	MemberIDs      []string `json:"member_ids"`
+	CreatedAt      int64    `json:"created_at"`
+}
+
+type SendGroupMessageResponse struct {
+	MsgID          string `json:"msg_id"`
+	ConversationID string `json:"conversation_id"`
+	Status         string `json:"status"`
+	ServerTS       int64  `json:"server_ts"`
+}
+
+type GroupMemberWithStatus struct {
+	UserID   string `json:"user_id"`
+	Role     string `json:"role"`
+	JoinedAt int64  `json:"joined_at"`
+	Online   bool   `json:"online"`
+}

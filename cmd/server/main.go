@@ -13,6 +13,7 @@ import (
 	"PingMe/internal/gateway"
 	"PingMe/internal/handler"
 	"PingMe/internal/handler/auth"
+	"PingMe/internal/handler/group"
 	"PingMe/internal/handler/userprofile"
 	"PingMe/internal/handler/ws"
 	"PingMe/internal/logger"
@@ -113,6 +114,7 @@ func main() {
 	jwtSvc := jwt.NewTokenService(&cfg.JWT)
 	userSvc := service.NewService(userRepo, jwtSvc)
 	msgSvc := service.NewMessageServiceWithKafka(msgRepo, userRepo, hub, kafkaProducer)
+	groupSvc := service.NewGroupService(msgRepo, userRepo, hub, kafkaProducer)
 
 	// 设置消息服务到 Hub（用于通过 WS 发送消息）
 	hub.MessageService = msgSvc
@@ -122,6 +124,7 @@ func main() {
 	authHandler := auth.NewHandler(userSvc)
 	userHandler := userprofile.NewHandler(userSvc)
 	messageHandler := msghandler.NewMessageHandler(msgSvc)
+	groupHandler := group.NewGroupHandler(groupSvc)
 
 	wsHandler := ws.NewHandler(cfg, hub)
 
@@ -185,6 +188,20 @@ func main() {
 		{
 			conversationRoutes.GET("", messageHandler.GetConversations)       // 获取会话列表
 			conversationRoutes.GET("/:id", messageHandler.GetConversation)   // 获取会话详情
+		}
+
+		// Group routes (auth required)
+		groupRoutes := v1.Group("/groups")
+		groupRoutes.Use(middleware.AuthMiddleware(jwtSvc))
+		{
+			groupRoutes.POST("", groupHandler.CreateGroup)                         // 创建群组
+			groupRoutes.GET("", groupHandler.GetUserGroups)                       // 获取用户加入的群组列表
+			groupRoutes.GET("/:group_id", groupHandler.GetGroupInfo)              // 获取群组详情
+			groupRoutes.POST("/join", groupHandler.JoinGroup)                     // 加群
+			groupRoutes.POST("/leave", groupHandler.LeaveGroup)                  // 退群
+			groupRoutes.GET("/:group_id/members", groupHandler.GetGroupMembers)  // 获取群成员列表
+			groupRoutes.GET("/:group_id/members/status", groupHandler.GetGroupMembersWebSocket) // 获取群成员列表（带在线状态）
+			groupRoutes.POST("/messages", groupHandler.SendGroupMessage)         // 发送群消息
 		}
 	}
 
