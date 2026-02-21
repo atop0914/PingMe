@@ -42,7 +42,7 @@ type Message struct {
 	ConversationID string         `json:"conversation_id" gorm:"type:varchar(128);index;not null"`
 	FromUserID     string         `json:"from_user_id" gorm:"type:varchar(36);index;not null"`
 	ToUserID       string         `json:"to_user_id" gorm:"type:varchar(36);index"` // 单聊时为目标用户ID
-	GroupID        string         `json:"group_id" gorm:"type:varchar(36);index"`    // 群聊时为群ID
+	GroupID        string         `json:"group_id" gorm:"type:varchar(128);index"`   // 群聊时为群ID
 	Content        string         `json:"content" gorm:"type:text;not null"`
 	ContentType    MessageType    `json:"content_type" gorm:"type:varchar(20);default:text"`
 	Status         MessageStatus `json:"status" gorm:"type:varchar(20);default:sending"`
