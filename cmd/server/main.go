@@ -28,6 +28,7 @@ import (
 	"PingMe/pkg/response"
 
 	"github.com/gin-gonic/gin"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 func main() {
@@ -140,10 +141,12 @@ func main() {
 	r.Use(middleware.RecoveryMiddleware())
 	r.Use(middleware.RequestIDMiddleware())
 	r.Use(middleware.CORSMiddleware())
+	r.Use(middleware.MetricsMiddleware())
 
 	// Health and version endpoints (no auth required)
 	r.GET("/health", baseHandler.HealthCheck)
 	r.GET("/version", baseHandler.VersionInfo)
+	r.GET("/metrics", gin.WrapH(promhttp.Handler()))
 
 	// WebSocket endpoint
 	r.GET("/ws", wsHandler.HandleWebSocket)

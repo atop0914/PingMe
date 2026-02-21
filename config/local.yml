@@ -52,3 +52,35 @@ logging:
   level: "debug"
   format: "json"
   output: "stdout"
+
+# Alert Configuration
+alert:
+  enabled: false
+  interval: 30 # seconds
+  rules:
+    - name: "error_rate_high"
+      metric: "error_rate"
+      condition: "gt"
+      threshold: 0.05
+      duration: 60
+      severity: "critical"
+      message: "错误率超过 5%，当前值: {{value}}"
+    - name: "kafka_lag_high"
+      metric: "kafka_consumer_lag"
+      condition: "gt"
+      threshold: 1000
+      duration: 120
+      severity: "warning"
+      message: "Kafka 消息堆积超过 1000 条，当前值: {{value}}"
+    - name: "latency_high"
+      metric: "p99_latency_ms"
+      condition: "gt"
+      threshold: 1000
+      duration: 60
+      severity: "warning"
+      message: "P99 延迟超过 1 秒，当前值: {{value}}ms"
+  webhook:
+    url: ""
+    method: "POST"
+    headers: {}
+    template: '{"alert": "{{.Rule.Name}}", "severity": "{{.Rule.Severity}}", "message": "{{.Rule.Message}}", "value": {{.Value}}, "timestamp": {{.Timestamp}}, "instance": "{{.Instance}}"}'
