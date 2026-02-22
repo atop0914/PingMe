@@ -1,0 +1,49 @@
+# Git
+.git
+.gitignore
+
+# Build artifacts
+bin/
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+finx-server
+pingme
+# pingme-server - keep for Docker builds
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Documentation (optional, can keep for reference)
+*.md
+!README.md
+docs/
+
+# Config - keep for Docker builds
+
+# Test coverage
+*.out
+coverage.txt
+
+# Logs
+*.log
+logs/
+
+# Docker
+docker-compose.override.yml
+.dockerignore
+Dockerfile
+.docker/
+
+# Misc
+.env
+.env.local
+*.tmp
+*.temp
